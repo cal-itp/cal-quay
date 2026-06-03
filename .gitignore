@@ -1,0 +1,11 @@
+# Pulled / generated data — never commit warehouse extracts
+data/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+
+# OS
+.DS_Store
