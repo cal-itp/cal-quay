@@ -4,7 +4,9 @@
 
 **What [AB 1599](https://leginfo.legislature.ca.gov/faces/billNavClient.xhtml?bill_id=202520260AB1599) mandates:**
 
-Caltrans must create the California Transit Stop Registry — a centralized, statewide dataset of standardized transit stop information — by December 31, 2026\. Every transit operator receiving TDA funds must conform their stop names and locations to the registry and use its unique identifiers in all published datasets (GTFS, amenity data, ridership data, trip-planning feeds) by June 1, 2027\.
+Caltrans must create the California Transit Stop Registry — a centralized, statewide dataset of standardized transit stop information — by June 1, 2027 (Gov. Code §14113). Every transit operator receiving TDA funds must conform their stop names and locations to the registry and use its unique identifiers in all published datasets (GTFS, amenity data, ridership data, trip-planning feeds) by January 1, 2028 (Pub. Util. Code §99150.5).
+
+*(Dates per AB 1599 as enrolled Aug 30, 2026 — both deadlines slipped ~6–7 months from the version this doc was originally drafted against: registry Dec 31 2026 → June 1 2027; operator compliance June 1 2027 → Jan 1 2028.)*
 
 **The problem this solves:**
 
@@ -70,7 +72,7 @@ DDS (maintains mappings)
 Agencies need to know what's required and how to do it. This covers:
 
 - What fields they need to add to GTFS (or whatever format is chosen)  
-- Timeline for compliance (AB 1599 says June 1, 2027\)  
+- Timeline for compliance (AB 1599 says operators conform by January 1, 2028\)  
 - How to request corrections or report issues with the registry  
 - How new stops get added to the registry  
 - What happens when multiple agencies share a stop  
@@ -186,7 +188,7 @@ R \= Does the work | A \= Signs off / answerable | C \= Provides input | I \= Ke
 | **Initial stop population** (bulk import \+ matching) | Registry team | Program lead | Transit operators (validate their data) | — |
 | **Stop matching quality** (near vs. combined decisions) | Registry team | Program lead | Transit operators (confirm/correct) | — |
 | **Guidance documentation** | Registry team | Program lead | Transit operators (review for clarity), analysts | — |
-| **Agency compliance** (adopting universal IDs by Jun 2027\) | Transit operators | Caltrans (legislative mandate) | Registry team (support, validation tooling) | Trip-planning apps, riders |
+| **Agency compliance** (adopting universal IDs by Jan 2028\) | Transit operators | Caltrans (legislative mandate) | Registry team (support, validation tooling) | Trip-planning apps, riders |
 | **Ongoing registry maintenance** (new stops, changes, decommissions) | Registry team | Program lead | Transit operators (submit changes) | — |
 | **Data quality enforcement** | Registry team | Program lead | Transit operators | — |
 
