@@ -17,28 +17,33 @@ then `uv run scripts/<name>.py`.
 gcloud auth application-default login                    # cal-itp-data-infra access
 uv sync                                                  # one-time: create the env
 
-uv run scripts/pull_stops.py --dry-run                   # ~3 GB scan — check first
+uv run scripts/pull_stops.py --dry-run                   # ~17 GB scan — check first
 uv run scripts/pull_stops.py                             # pulls once, reprocesses locally after
 uv run scripts/find_shared_stops.py
 ```
 
 ### `pull_stops.py`
-The full list of current California GTFS stops, minus the obvious out-of-scope rows: the latest
-month of *served* stops from `mart_gtfs_rollup.fct_monthly_scheduled_stops` (more complete on
-feeds than `dim_stops_latest`, which silently drops feeds on its `_is_current` join), excluding
-the Bay Area 511 regional aggregator's duplicate copies, Regional Precursor Feeds (an operator's
-direct feed that 511/VCTC re-publishes — kept only when it's the operator's sole feed), rail-only
-stations (by GTFS `route_type`), and exact same-stop duplicates published under two dataset
-names. Two stages: the raw query result is saved to `stops_raw_<YYYY_MM>.parquet`, and the
-exclusions run as a separate local step — re-running the script reprocesses the raw file without
-touching BigQuery (`--refresh` forces a new pull).
+The full list of current California GTFS stops, from two sources unioned: the latest **complete**
+month of *served* stops from `mart_gtfs_rollup.fct_monthly_scheduled_stops` (the in-progress
+month silently drops any feed with a processing hiccup — it lost NCTD in Sept 2026), plus
+current-extract rows from `dim_stops_latest` that the rollup month lacks (unserved stops.txt
+entries, station/entrance records, newer feeds) flagged `served_in_month = False`. Each row
+carries `location_type` / `parent_station` / `wheelchair_boarding` and a `customer_facing` flag
+(the scope the DDS Metabase "latest public facing gtfs stops" question filters on — carried as
+a column, not a filter). Excluded: the Bay Area 511 regional aggregator's duplicate copies,
+Regional Precursor Feeds (an operator's direct feed that 511/VCTC re-publishes — kept only when
+it's the operator's sole feed), rail-only stops among the served rows (by GTFS `route_type`),
+and exact same-stop duplicates published under two dataset names. Two stages: the raw query
+results are saved to `stops_raw_<YYYY_MM>.parquet`, and the cleaning runs as a separate local
+step — re-running the script reprocesses the raw file without touching BigQuery (`--refresh`
+forces a new pull).
 
 ### `find_shared_stops.py`
 Groups the pulled stops by geohash cell (default precision 8, ~38 m × 19 m — "the same corner")
 and keeps cells where **two or more agencies** each have a stop: the candidate shared stops the
 registry needs to consolidate. Geohashes come precomputed from BigQuery's `ST_GEOHASH` in the
 pull (precisions 7/8/9, matching `transit-amenity-atlas`), so `--precision` switches cell size
-without re-pulling.
+without re-pulling. Uses served stops only by default (`--include-unserved` to widen).
 
 Both write to `data/` (gitignored): a `<name>_<date>.csv` plus `.gpkg` (QGIS + ArcGIS Pro) and
 `.fgb` (QGIS-native; ArcGIS via Data Interoperability) point layers.

@@ -2,9 +2,20 @@
 Pull the full list of current California GTFS stops, minus stops we shouldn't
 consider: the 511 regional aggregator's duplicate copies and rail-only stations.
 
-Source: mart_gtfs_rollup.fct_monthly_scheduled_stops — every stop that had
-scheduled service in the most recent month. More complete on feeds than
-dim_stops_latest.
+Two sources, unioned:
+  - mart_gtfs_rollup.fct_monthly_scheduled_stops — every stop that had
+    scheduled service in the latest COMPLETE month (the in-progress month drops
+    any feed with a processing hiccup — it silently lost NCTD in Sept 2026).
+    These rows carry route_types and arrivals; served_in_month = True.
+  - mart_gtfs_schedule_latest.dim_stops_latest — stops in the current extract
+    that the rollup month lacks: unserved stops.txt entries, station records
+    (location_type 1/2), and feeds missing from the rollup. served_in_month =
+    False; no route_types/arrivals.
+
+Each row also carries location_type / parent_station / wheelchair_boarding and
+a customer_facing flag (from dim_provider_gtfs_data — the same scope the
+"latest public facing gtfs stops" Metabase question filters on; we carry it as
+a column instead of filtering, pending the registry-scope decision).
 
 Exclusions:
   - feed "Bay Area 511 Regional Schedule": the aggregate feed re-publishing every
@@ -50,6 +61,8 @@ DATA_DIR = REPO_ROOT / "data"
 
 TABLE = "cal-itp-data-infra.mart_gtfs_rollup.fct_monthly_scheduled_stops"
 TABLE_DATASETS = "cal-itp-data-infra.mart_transit_database.dim_gtfs_datasets"
+TABLE_PROVIDERS = "cal-itp-data-infra.mart_transit_database.dim_provider_gtfs_data"
+TABLE_LATEST = "cal-itp-data-infra.mart_gtfs_schedule_latest.dim_stops_latest"
 
 EXCLUDE_FEEDS = {"Bay Area 511 Regional Schedule"}
 RAIL_ROUTE_TYPES = {"0", "1", "2"}
@@ -120,10 +133,8 @@ ALIASES = {
     "Yuba-Sutter PassioGo Schedule": "Yuba-Sutter Transit Authority",
 }
 
-SQL = f"""
-WITH latest_month AS (
-  SELECT MAX(month_first_day) AS m FROM `{TABLE}`
-),
+# shared lookup CTEs: dataset name -> curated labels + flags
+_LOOKUPS = f"""
 name_map AS (
   SELECT
     name,
@@ -132,11 +143,27 @@ name_map AS (
   FROM `{TABLE_DATASETS}`
   WHERE name IS NOT NULL
   GROUP BY name
-)
+),
+customer_map AS (
+  SELECT d.name, LOGICAL_OR(p.gtfs_service_data_customer_facing) AS customer_facing
+  FROM `{TABLE_PROVIDERS}` p
+  JOIN `{TABLE_DATASETS}` d
+    ON d.key = p.schedule_gtfs_dataset_key AND d._is_current
+  WHERE p._is_current
+  GROUP BY d.name
+)"""
+
+SQL_MONTHLY = f"""
+WITH latest_complete_month AS (
+  SELECT MAX(month_first_day) AS m FROM `{TABLE}`
+  WHERE month_first_day < DATE_TRUNC(CURRENT_DATE('America/Los_Angeles'), MONTH)
+),
+{_LOOKUPS}
 SELECT
   COALESCE(nm.analysis_name, ms.name) AS analysis_name,
   ms.name                             AS feed_name,
   nm.regional_feed_type,
+  cm.customer_facing,
   ms.stop_id,
   ms.stop_name,
   ms.stop_code,
@@ -146,13 +173,50 @@ SELECT
   ST_GEOHASH(ms.pt_geom, 7)           AS geohash_id_7,
   ST_GEOHASH(ms.pt_geom, 8)           AS geohash_id_8,
   ST_GEOHASH(ms.pt_geom, 9)           AS geohash_id_9,
+  ms.location_type,
+  ms.parent_station,
+  ms.wheelchair_boarding,
   ms.route_type_array,
   ms.total_stop_arrivals,
   ms.day_type,
   ms.month_first_day
 FROM `{TABLE}` ms
-JOIN latest_month lm ON ms.month_first_day = lm.m
+JOIN latest_complete_month lm ON ms.month_first_day = lm.m
 LEFT JOIN name_map nm ON ms.name = nm.name
+LEFT JOIN customer_map cm ON ms.name = cm.name
+"""
+
+# the current extract: supplies unserved stops.txt entries, station records,
+# and feeds absent from the rollup month; deduped against the rollup locally
+SQL_LATEST = f"""
+WITH dataset_names AS (
+  SELECT base64_url, ANY_VALUE(name) AS name
+  FROM `{TABLE_DATASETS}`
+  WHERE _is_current AND base64_url IS NOT NULL
+  GROUP BY base64_url
+),
+{_LOOKUPS}
+SELECT
+  COALESCE(nm.analysis_name, dn.name)  AS analysis_name,
+  dn.name                              AS feed_name,
+  nm.regional_feed_type,
+  cm.customer_facing,
+  ls.stop_id,
+  ls.stop_name,
+  ls.stop_code,
+  ls.key                               AS stop_key,
+  ST_Y(ls.pt_geom)                     AS stop_lat,
+  ST_X(ls.pt_geom)                     AS stop_lon,
+  ST_GEOHASH(ls.pt_geom, 7)            AS geohash_id_7,
+  ST_GEOHASH(ls.pt_geom, 8)            AS geohash_id_8,
+  ST_GEOHASH(ls.pt_geom, 9)            AS geohash_id_9,
+  ls.location_type,
+  ls.parent_station,
+  ls.wheelchair_boarding
+FROM `{TABLE_LATEST}` ls
+JOIN dataset_names dn ON ls.base64_url = dn.base64_url
+LEFT JOIN name_map nm ON dn.name = nm.name
+LEFT JOIN customer_map cm ON dn.name = cm.name
 """
 
 
@@ -166,8 +230,10 @@ def dry_run() -> float:
     from google.cloud import bigquery
 
     jc = bigquery.QueryJobConfig(dry_run=True, use_query_cache=False)
-    job = _client().query(SQL, job_config=jc)
-    return job.total_bytes_processed / 1e9
+    client = _client()
+    return sum(
+        client.query(q, job_config=jc).total_bytes_processed for q in (SQL_MONTHLY, SQL_LATEST)
+    ) / 1e9
 
 
 def _union_route_types(s: pd.Series) -> str:
@@ -184,16 +250,22 @@ def _rail_only(route_types: str) -> bool:
 
 
 def pull_raw(outdir: Path) -> Path:
-    """Run the BigQuery pull and save the untouched result as parquet."""
-    print(f"Querying BigQuery: {TABLE} (latest month)...")
-    df = _client().query(SQL).to_dataframe()
+    """Run both BigQuery pulls and save the combined result as parquet."""
+    client = _client()
+    print(f"Querying BigQuery: {TABLE} (latest complete month)...")
+    monthly = client.query(SQL_MONTHLY).to_dataframe()
+    print(f"Querying BigQuery: {TABLE_LATEST} (current extract)...")
+    latest = client.query(SQL_LATEST).to_dataframe()
+    monthly["source"] = "rollup"
+    latest["source"] = "latest"
+    df = pd.concat([monthly, latest], ignore_index=True)
     # plain datetime: the BigQuery client's 'dbdate' extension dtype doesn't
     # survive a parquet round-trip without db_dtypes imported at read time
     df["month_first_day"] = pd.to_datetime(df["month_first_day"])
-    month = df["month_first_day"].iloc[0]
-    raw_out = outdir / f"stops_raw_{month:%Y_%m}.parquet"
+    month = monthly["month_first_day"].iloc[0]
+    raw_out = outdir / f"stops_raw_{pd.to_datetime(month):%Y_%m}.parquet"
     df.to_parquet(raw_out, index=False)
-    print(f"  {len(df):,} raw rows -> {raw_out}")
+    print(f"  {len(monthly):,} rollup rows + {len(latest):,} latest-extract rows -> {raw_out}")
     return raw_out
 
 
@@ -204,17 +276,21 @@ def process(raw_path: Path, outdir: Path) -> None:
     df["stop_lon"] = pd.to_numeric(df["stop_lon"], errors="coerce")
     df = df.dropna(subset=["stop_lat", "stop_lon"]).reset_index(drop=True)
 
-    month = pd.to_datetime(df["month_first_day"].iloc[0])
+    month = pd.to_datetime(df["month_first_day"].dropna().iloc[0])
     stamp = f"{month:%Y_%m}"
 
-    # one row per stop: coords identical across day_types; union types, sum arrivals
+    rollup = df[df["source"] == "rollup"]
+    latest = df[df["source"] == "latest"]
+
+    # one row per served stop: coords identical across day_types; union types, sum arrivals
     stops = (
-        df.sort_values("total_stop_arrivals", ascending=False)
+        rollup.sort_values("total_stop_arrivals", ascending=False)
         .groupby("stop_key", as_index=False)
         .agg(
             analysis_name=("analysis_name", "first"),
             feed_name=("feed_name", "first"),
             regional_feed_type=("regional_feed_type", "first"),
+            customer_facing=("customer_facing", "first"),
             stop_id=("stop_id", "first"),
             stop_name=("stop_name", "first"),
             stop_code=("stop_code", "first"),
@@ -223,11 +299,31 @@ def process(raw_path: Path, outdir: Path) -> None:
             geohash_id_7=("geohash_id_7", "first"),
             geohash_id_8=("geohash_id_8", "first"),
             geohash_id_9=("geohash_id_9", "first"),
+            location_type=("location_type", "first"),
+            parent_station=("parent_station", "first"),
+            wheelchair_boarding=("wheelchair_boarding", "first"),
             total_stop_arrivals=("total_stop_arrivals", "sum"),
             route_types=("route_type_array", _union_route_types),
         )
     )
+    stops["served_in_month"] = True
+
+    # supplement with current-extract rows the rollup month lacks: unserved
+    # stops.txt entries, station records, and feeds absent from the rollup
+    extra = latest.drop_duplicates(subset=["feed_name", "stop_id"]).copy()
+    have = set(zip(stops["feed_name"], stops["stop_id"]))
+    extra = extra[[k not in have for k in zip(extra["feed_name"], extra["stop_id"])]]
+    extra["route_types"] = ""
+    extra["served_in_month"] = False
+    n_served = len(stops)
+    stops = pd.concat([stops, extra[stops.columns]], ignore_index=True)
     stops["month"] = f"{month:%Y-%m}"
+    # regional subfeeds carry customer_facing=False on their service rows, but
+    # they ARE the public representation of their operator (cf. the Metabase
+    # "public facing" scope) — count them as customer-facing
+    stops["customer_facing"] = stops["customer_facing"].astype("boolean").fillna(False) | (
+        stops["regional_feed_type"] == "Regional Subfeed"
+    )
     stops["analysis_name"] = (
         stops["feed_name"].map(ALIASES).fillna(stops["analysis_name"])
     )
@@ -250,7 +346,8 @@ def process(raw_path: Path, outdir: Path) -> None:
     stops = stops[~dup_exact].drop(columns="_fallback").reset_index(drop=True)
 
     print(
-        f"  {n_all:,} unique served stops (month {month:%Y-%m}); excluding "
+        f"  {n_served:,} served stops (month {month:%Y-%m}) + {n_all - n_served:,} "
+        f"latest-extract-only (unserved / stations / missing feeds); excluding "
         f"{dup_511.sum():,} 511-regional duplicates + "
         f"{dup_precursor.sum():,} precursor-feed duplicates + {rail.sum():,} rail-only + "
         f"{dup_exact.sum():,} exact cross-feed duplicates "
@@ -288,7 +385,8 @@ def main() -> None:
         return
 
     args.outdir.mkdir(exist_ok=True)
-    raws = sorted(args.outdir.glob("stops_raw_*.parquet"))
+    # newest by mtime, not filename: the complete-month stamp can move backwards
+    raws = sorted(args.outdir.glob("stops_raw_*.parquet"), key=lambda p: p.stat().st_mtime)
     if raws and not args.refresh:
         raw = raws[-1]
         print(f"Reprocessing {raw.name} (use --refresh for a fresh BigQuery pull)")
