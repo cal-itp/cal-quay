@@ -2,7 +2,7 @@
 
 The California Transit Stop Registry — Cal-ITP's working space for
 [AB 1599](https://leginfo.legislature.ca.gov/faces/billNavClient.xhtml?bill_id=202520260AB1599)
-(enrolled Aug 30, 2026), which requires Caltrans to publish a statewide registry giving every
+(signed Sept 18, 2026 — Chapter 269, Statutes of 2026), which requires Caltrans to publish a statewide registry giving every
 physical transit stop one canonical identity and universal ID by **June 1, 2027** (Gov. Code
 §14113). TDA-funded operators must then conform their stop names/locations to the registry and
 use its identifiers by **Jan 1, 2028** (Pub. Util. Code §99150.5).
