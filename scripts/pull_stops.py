@@ -58,6 +58,14 @@ import pandas as pd
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = REPO_ROOT / "data"
+# Official CDEGIS state boundary (gis.data.ca.gov), vendored from
+# transit-amenity-atlas/stop_ids/ref_data. Used to screen out the out-of-state
+# stops that national/cross-border carriers publish (FlixBus/Greyhound, Amtrak,
+# Oregon POINT, NV-side Tahoe, AZ-side Yuma, ...).
+CA_BOUNDARY = REPO_ROOT / "ref_data" / "California_State_Boundary.geojson"
+# Keep stops within this distance of the boundary: border-town curbs, piers and
+# ferry landings sit meters outside the land polygon but belong to CA service.
+CA_CLIP_BUFFER_M = 500.0
 
 TABLE = "cal-itp-data-infra.mart_gtfs_rollup.fct_monthly_scheduled_stops"
 TABLE_DATASETS = "cal-itp-data-infra.mart_transit_database.dim_gtfs_datasets"
@@ -403,6 +411,21 @@ def process(raw_path: Path, outdir: Path) -> None:
     dup_exact = stops.duplicated(subset=["stop_id", "stop_name", "stop_lat", "stop_lon"])
     stops = stops[~dup_exact].drop(columns="_fallback").reset_index(drop=True)
     stops["route_dirs"] = stops["route_dirs"].map(_dirs_to_str)
+
+    # clip to California: a per-stop spatial screen, not a per-agency exclusion —
+    # cross-border carriers keep their in-CA stops
+    ca = gpd.read_file(CA_BOUNDARY).to_crs("EPSG:3310").union_all().buffer(CA_CLIP_BUFFER_M)
+    pts = gpd.GeoSeries(
+        gpd.points_from_xy(stops["stop_lon"], stops["stop_lat"]), crs="EPSG:4326"
+    ).to_crs("EPSG:3310")
+    in_ca = pts.within(ca).to_numpy()
+    dropped = stops[~in_ca]
+    if len(dropped):
+        top = dropped.groupby("analysis_name").size().sort_values(ascending=False)
+        detail = ", ".join(f"{a} {n}" for a, n in top.head(5).items())
+        print(f"  clipped {len(dropped):,} non-California stops "
+              f"(> {CA_CLIP_BUFFER_M:.0f} m outside the state boundary): {detail}, ...")
+    stops = stops[in_ca].reset_index(drop=True)
 
     print(
         f"  {n_served:,} served stops (month {month:%Y-%m}) + {n_all - n_served:,} "
