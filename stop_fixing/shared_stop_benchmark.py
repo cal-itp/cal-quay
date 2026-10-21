@@ -109,19 +109,94 @@ CALTRANS_CATEGORY = "Caltrans District Focus Stops"
 # stop and that sit in that district. Until populated, the case is reported as
 # skipped.
 CALTRANS_DISTRICT_FIXTURES: List[Fixture] = [
-    same("District 1 - Eureka (North Coast)", CALTRANS_CATEGORY,
-         ('Humboldt Transit Authority', '1283'), ('Yurok Tribe', 'bn67'), ('Trinity Remix Schedule', '4556')),
-    same("District 2 - Redding (Northeastern CA)", CALTRANS_CATEGORY),
-    same("District 3 - Marysville (Sacramento Area)", CALTRANS_CATEGORY),
-    same("District 4 - Oakland (Bay Area)", CALTRANS_CATEGORY),
-    same("District 5 - San Luis Obispo (Central Coast)", CALTRANS_CATEGORY),
-    same("District 6 - Fresno (Central Valley)", CALTRANS_CATEGORY),
-    same("District 7 - Los Angeles", CALTRANS_CATEGORY),
-    same("District 8 - San Bernardino (Inland Empire)", CALTRANS_CATEGORY),
-    same("District 9 - Bishop (Eastern Sierra)", CALTRANS_CATEGORY),
-    same("District 10 - Stockton (Central Sierra / San Joaquin)", CALTRANS_CATEGORY),
-    same("District 11 - San Diego", CALTRANS_CATEGORY),
-    same("District 12 - Irvine (Orange County)", CALTRANS_CATEGORY),
+    same(
+        "District 1 - Eureka (North Coast)", 
+        CALTRANS_CATEGORY,
+        ('Humboldt Transit Authority', '1283'), 
+        ('Yurok Tribe', 'bn67'), 
+        ('Trinity Remix Schedule', '4556')
+    ),
+    same(
+        "District 2 - Redding (Northeastern CA)", 
+        CALTRANS_CATEGORY,
+         ('Amtrak', 'RBF'), 
+         ('Redding Area Bus Authority', '9902'), 
+         ('San Joaquin Joint Powers Authority', 'bRBF'), 
+         ('Tehama County', '60')
+    ),
+    same(
+        "District 3 - Marysville (Sacramento Area)", 
+        CALTRANS_CATEGORY,
+         ('City of Elk Grove', '9966'), 
+         ('City of Roseville', '53217'), 
+         ('City of Roseville', '53007'), 
+         ('El Dorado County Transit Authority', '2745554'), 
+         ('Placer County', '6010'),
+         ('Yolo County Transportation District', '23414'),
+         ('Yuba-Sutter Transit Authority', '206338'),
+         ('Yuba-Sutter Transit Authority', '12408')
+    ),
+    same(
+        "District 4 - Oakland (Bay Area)", 
+        CALTRANS_CATEGORY,
+        ('Alameda-Contra Costa Transit District', '51397'),
+        ('Stanford University', '154')
+    ),
+    same(
+        "District 5 - San Luis Obispo (Central Coast)", 
+        CALTRANS_CATEGORY,
+        ('City of Lompoc', '3740'),
+        ('City of Santa Maria', '2973e49c-465b-498f-91de-6d58ba0a5839'),
+        ('City of Solvang', 'exp_04')
+    ),
+    same(
+        "District 6 - Fresno (Central Valley)", 
+        CALTRANS_CATEGORY,
+        ('FlixBus and Greyhound', '7d2e6c99-dc26-4de7-9095-f675fcf55339'),
+        ('Madera County', '20548')
+    ),
+    same(
+        "District 7 - Los Angeles", 
+        CALTRANS_CATEGORY,
+        ('Orange County Transportation Authority', '1040'),
+        ('Long Beach Transit', '1916'),
+        ('Los Angeles County Metropolitan Transportation Authority', '2292')
+    ),
+    same(
+        "District 8 - San Bernardino (Inland Empire)", 
+        CALTRANS_CATEGORY,
+        ('City of Banning', '11583'),
+        ('City of Beaumont', '11677'),
+        ('Riverside Transit Agency', '1829'),
+        ('SunLine Transit Agency', '11130190')
+    ),
+    same(
+        "District 9 - Bishop (Eastern Sierra)", 
+        CALTRANS_CATEGORY,
+        ('City of Ridgecrest', '2619652'),
+        ('Eastern Sierra Transit Authority', '2501531'),
+        ('Kern County', '771460')
+    ),
+    same(
+        "District 10 - Stockton (Central Sierra / San Joaquin)", 
+        CALTRANS_CATEGORY,
+        ('City of Turlock', '2615945'),
+        ('Stanislaus Regional Transit Authority', '931'),
+        ('Transit Joint Powers Authority for Merced County', '474921')
+    ),
+    same(
+        "District 11 - San Diego", 
+        CALTRANS_CATEGORY,
+        ('University of California, San Diego', '11852'),
+        ('San Diego Metropolitan Transit System, Airport, Flagship Cruises', '11852')
+    ),
+    same(
+        "District 12 - Irvine (Orange County)", 
+        CALTRANS_CATEGORY,
+        ('City of Dana Point', '194172'),
+        ('City of Laguna Beach', '2751734'),
+        ('Orange County Transportation Authority', '1509')
+    ),
 ]
 
 # Stops that must share a unique_id. Template:
@@ -143,10 +218,24 @@ SHOULD_MATCH_FIXTURES: List[Fixture] = [
 #             ("Agency A Schedule", "stop_124"),
 #             notes="why these are different stops")
 SHOULD_NOT_MATCH_FIXTURES: List[Fixture] = [
-    # different("Opposite sides of a street", "Opposite sides of street",
-    #           ("Agency A Schedule", "stop_123_north"), ("Agency A Schedule", "stop_123_south")),
-    # different("Adjacent stops on one route", "Nearby but distinct stops",
-    #           ("Agency A Schedule", "stop_200"), ("Agency A Schedule", "stop_201")),
+    different(
+        "18th & Castro, San Francisco", 
+        "Stops on same corner or intersection, but on different roads",
+        ("City and County of San Francisco", "13326"), 
+        ("City and County of San Francisco", "14314")
+    ),
+    different(
+        "18th & Eureka, San Francisco", 
+        "Stops on same street, but on different side of street",
+        ("City and County of San Francisco", "13332"), 
+        ("City and County of San Francisco", "14535")
+    ),
+    different(
+        "Consumnes River College, Sacramento", 
+        "Rail-only and Bus-only Platforms should be separate",
+        ("Sacramento Regional Transit District", "906"), 
+        ("Sacramento Regional Transit District", "7097")
+    ), 
 ]
 
 # --------------------------------------------------------------------------- #
