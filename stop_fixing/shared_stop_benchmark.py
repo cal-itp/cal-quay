@@ -58,7 +58,9 @@ quality dimensions you compare algorithms on; invent new ones freely.
 
 A fixture whose stops are not present in the supplied file is reported as
 *skipped* rather than passed or failed, so a run against a partial dataset is
-not silently graded on stops that were never there.
+not silently graded on stops that were never there. A stop that is in the file
+but has a blank ``unique_id`` was left ungrouped by the algorithm: that fails a
+"should match" fixture, and cannot collide in a "should not match" fixture.
 """
 
 import argparse
@@ -107,7 +109,8 @@ CALTRANS_CATEGORY = "Caltrans District Focus Stops"
 # stop and that sit in that district. Until populated, the case is reported as
 # skipped.
 CALTRANS_DISTRICT_FIXTURES: List[Fixture] = [
-    same("District 1 - Eureka (North Coast)", CALTRANS_CATEGORY),
+    same("District 1 - Eureka (North Coast)", CALTRANS_CATEGORY,
+         ('Humboldt Transit Authority', '1283'), ('Yurok Tribe', 'bn67'), ('Trinity Remix Schedule', '4556')),
     same("District 2 - Redding (Northeastern CA)", CALTRANS_CATEGORY),
     same("District 3 - Marysville (Sacramento Area)", CALTRANS_CATEGORY),
     same("District 4 - Oakland (Bay Area)", CALTRANS_CATEGORY),
@@ -269,20 +272,28 @@ def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 
 class Inputs:
-    """The input file, its column mapping, and a lookup from GTFS stop -> assigned unique_ids."""
+    """The input file, its column mapping, and a lookup from GTFS stop -> assigned unique_ids.
+
+    `present` is every stop in the file; `ids` only has the stops that were given
+    a unique_id. A present stop with no entry in `ids` was left unassigned by the
+    algorithm, which is different from the stop not being in the file at all.
+    """
 
     def __init__(self, data: FileData, columns: Columns):
         self.data = data
         self.columns = columns
+        self.present: Set[StopRef] = set()
         self.ids: Dict[StopRef, Set[str]] = {}
         self.coords: Dict[StopRef, Tuple[float, float]] = {}
         if self.usable:
             c = columns
             for row in data.rows:
-                if any(is_blank(row.get(h)) for h in (c.gtfs_schedule_name, c.gtfs_stop_id, c.unique_id)):
+                if any(is_blank(row.get(h)) for h in (c.gtfs_schedule_name, c.gtfs_stop_id)):
                     continue
                 ref = (row[c.gtfs_schedule_name].strip(), row[c.gtfs_stop_id].strip())
-                self.ids.setdefault(ref, set()).add(row[c.unique_id].strip())
+                self.present.add(ref)
+                if not is_blank(row.get(c.unique_id)):
+                    self.ids.setdefault(ref, set()).add(row[c.unique_id].strip())
                 if not coordinate_error(row.get(c.latitude), -90, 90) and not coordinate_error(
                     row.get(c.longitude), -180, 180
                 ):
@@ -429,18 +440,18 @@ def format_tests(inputs: Inputs) -> List[BenchmarkTest]:
 # ---- fixture tests --------------------------------------------------------- #
 
 def _describe(inputs: Inputs, ref: StopRef) -> str:
-    ids = inputs.ids[ref]
-    return f"{ref[0]} / {ref[1]} -> {', '.join(sorted(ids))}"
+    ids = inputs.ids.get(ref)
+    return f"{ref[0]} / {ref[1]} -> {', '.join(sorted(ids)) if ids else '(no unique_id)'}"
 
 
 def _resolve(t: unittest.TestCase, inputs: Inputs, fixture: Fixture) -> List[StopRef]:
-    """Skip unless the fixture is populated and every stop is in the GTFS file."""
+    """Skip unless the fixture is populated and every stop is in the input file."""
     if not inputs.usable:
         t.skipTest("input file is not usable (see file format tests)")
     if len(fixture.stops) < 2:
         t.skipTest("fixture not populated yet (needs at least 2 stops)")
     refs = [(n.strip(), s.strip()) for n, s in fixture.stops]
-    absent = [r for r in refs if r not in inputs.ids]
+    absent = [r for r in refs if r not in inputs.present]
     if absent:
         t.skipTest("stop(s) not in input file: " + ", ".join(f"{n} / {s}" for n, s in absent))
     return refs
@@ -449,6 +460,10 @@ def _resolve(t: unittest.TestCase, inputs: Inputs, fixture: Fixture) -> List[Sto
 def _same_check(inputs: Inputs, fixture: Fixture):
     def check(t: unittest.TestCase):
         refs = _resolve(t, inputs, fixture)
+        unassigned = [r for r in refs if r not in inputs.ids]
+        if unassigned:
+            t.fail("expected one shared unique_id but stop(s) were not assigned any (blank unique_id): "
+                   + "; ".join(_describe(inputs, r) for r in refs))
         all_ids = set().union(*(inputs.ids[r] for r in refs))
         multi = [r for r in refs if len(inputs.ids[r]) > 1]
         if multi:
@@ -464,11 +479,12 @@ def _same_check(inputs: Inputs, fixture: Fixture):
 def _different_check(inputs: Inputs, fixture: Fixture):
     def check(t: unittest.TestCase):
         refs = _resolve(t, inputs, fixture)
-        multi = [r for r in refs if len(inputs.ids[r]) > 1]
+        multi = [r for r in refs if len(inputs.ids.get(r, ())) > 1]
         if multi:
             t.fail("stop has more than one unique_id in file: " + "; ".join(_describe(inputs, r) for r in multi))
+        # A stop with no unique_id is not grouped with anything, so it cannot collide.
         collisions = [
-            (a, b) for a, b in combinations(refs, 2) if inputs.ids[a] & inputs.ids[b]
+            (a, b) for a, b in combinations(refs, 2) if inputs.ids.get(a, set()) & inputs.ids.get(b, set())
         ]
         if collisions:
             parts = []
