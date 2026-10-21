@@ -38,3 +38,22 @@ Outputs (written to `data/`, gitignored):
 **Known limitation:** `analysis_name` is feed-level, so light rail bundled inside a mixed agency
 (Muni Metro, VTA LRT, LA Metro Rail, SD Trolley, Sac RT) is not yet excluded — that needs GTFS
 `route_type`.
+
+### `shared_stop_benchmark.py`
+
+A test harness for benchmarking algorithms that identify shared stops. It scores the *output* of
+an algorithm against test cases, so different algorithms can be compared on the same footing. It
+uses only the Python standard library.
+
+Input is one CSV with a row per GTFS Schedule stop: the GTFS Schedule feed, the stop ID, latitude,
+longitude, and the deduplicated stop ID the algorithm assigned. The column headers are mapped to
+those fields in `shared_stop_benchmark.config.json` (or a file passed with `--config`).
+
+```bash
+python stop_fixing/shared_stop_benchmark.py --input stops.csv --label "my-algo" --json out.json
+```
+
+It checks the file format, then "should match" and "should not match" fixtures (which are lists at
+the top of the script, easy to extend), and reports pass/fail counts overall and per category.
+The 12 "Caltrans District Focus Stops" cases are placeholders until real stop pairs are added;
+until then they are reported as skipped. See the script's docstring for details.
