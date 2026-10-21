@@ -457,22 +457,51 @@ def _resolve(t: unittest.TestCase, inputs: Inputs, fixture: Fixture) -> List[Sto
     return refs
 
 
+def _match_breakdown(inputs: Inputs, refs: List[StopRef]) -> str:
+    """Multi-line summary of which stops shared a unique_id and which did not."""
+    by_id: "OrderedDict[str, List[StopRef]]" = OrderedDict()
+    unassigned, ambiguous = [], []
+    for r in refs:
+        ids = inputs.ids.get(r, set())
+        if not ids:
+            unassigned.append(r)
+        elif len(ids) > 1:
+            ambiguous.append(r)
+        else:
+            by_id.setdefault(next(iter(ids)), []).append(r)
+
+    def stops(rs):
+        return "; ".join(f"{n} / {s}" for n, s in rs)
+
+    matched = [(i, rs) for i, rs in by_id.items() if len(rs) > 1]
+    alone = [(i, rs) for i, rs in by_id.items() if len(rs) == 1]
+    lines = []
+    if matched:
+        lines.append("matched (same unique_id):")
+        lines += [f"  {i}: {stops(rs)}" for i, rs in matched]
+    if alone or unassigned or ambiguous:
+        lines.append("not matched:")
+        lines += [f"  {i}: {stops(rs)}" for i, rs in alone]
+        lines += [f"  (no unique_id): {stops([r])}" for r in unassigned]
+        lines += [f"  (multiple unique_ids {', '.join(sorted(inputs.ids[r]))}): {stops([r])}" for r in ambiguous]
+    return "\n".join(lines)
+
+
 def _same_check(inputs: Inputs, fixture: Fixture):
     def check(t: unittest.TestCase):
         refs = _resolve(t, inputs, fixture)
+        all_ids = set().union(*(inputs.ids.get(r, set()) for r in refs))
         unassigned = [r for r in refs if r not in inputs.ids]
-        if unassigned:
-            t.fail("expected one shared unique_id but stop(s) were not assigned any (blank unique_id): "
-                   + "; ".join(_describe(inputs, r) for r in refs))
-        all_ids = set().union(*(inputs.ids[r] for r in refs))
-        multi = [r for r in refs if len(inputs.ids[r]) > 1]
-        if multi:
-            t.fail("stop has more than one unique_id in file: " + "; ".join(_describe(inputs, r) for r in multi))
-        if len(all_ids) > 1:
-            spread = inputs.spread_m(refs)
-            where = f" (stops are up to {spread:.0f} m apart)" if spread is not None else ""
-            t.fail("expected one shared unique_id but got " + str(len(all_ids)) + where + ": "
-                   + "; ".join(_describe(inputs, r) for r in refs))
+        multi = [r for r in refs if len(inputs.ids.get(r, ())) > 1]
+        if not (unassigned or multi or len(all_ids) > 1):
+            return
+        matched_n = max(
+            (sum(1 for r in refs if inputs.ids.get(r) == {i}) for i in all_ids), default=0)
+        headline = f"expected all {len(refs)} stops to share one unique_id; largest matching group is {matched_n}"
+        spread = inputs.spread_m(refs)
+        if spread is not None:
+            headline += f" (stops are up to {spread:.0f} m apart)"
+        t.fail(headline + "\n" + _match_breakdown(inputs, refs))
     return check
 
 
@@ -551,7 +580,7 @@ def print_report(outcomes: List[Outcome], label: str, input_path: str, columns: 
     if failures:
         print("\nFAILURES")
         for o in failures:
-            print(f"  [{o.category}] {o.name}\n      {o.message}")
+            print(f"  [{o.category}] {o.name}\n      " + o.message.replace("\n", "\n      "))
     skipped = [o for o in outcomes if o.status == "skipped"]
     if skipped and verbose:
         print("\nSKIPPED")
