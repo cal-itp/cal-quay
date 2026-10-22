@@ -10,8 +10,10 @@ Group statewide stops: distance cluster -> constrained direction/road split
   3. OSM scoring: dist-to-road + in_roadway per stop (EPSG:3310, statewide). The
      canonical pick demotes in-roadway stops, then prefers the most-served.
 
-OSM data (atlas caches): norcal/socal drive networks, read per spatial tile so the
-1.8 GB of road geometry is never loaded all at once.
+OSM road data, read per spatial tile: prefers data/roads_near_stops.fgb (geometry-
+only edges within 150 m of any stop — build with scripts/trim_roads.py), falling
+back to the full atlas norcal/socal drive networks (~1.8 GB). With neither present,
+the trimmed file is auto-downloaded (~220 MB, once) from the public cal-itp bucket.
 
   uv run scripts/cluster_stops.py
   uv run scripts/cluster_stops.py --input data/stops_2026_09.csv
@@ -19,11 +21,13 @@ OSM data (atlas caches): norcal/socal drive networks, read per spatial tile so t
 
 import argparse
 import math
+import urllib.request
 from pathlib import Path
 
 import geopandas as gpd
 import numpy as np
 import pandas as pd
+import pyogrio
 from shapely.geometry import LineString
 from shapely.ops import linemerge, unary_union
 from sklearn.cluster import DBSCAN
@@ -31,7 +35,11 @@ from sklearn.cluster import DBSCAN
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = REPO_ROOT / "data"
 ATLAS_DATA = Path.home() / "github/transit-amenity-atlas/data"
-DRIVE_FGBS = [ATLAS_DATA / "norcal_drive_network.fgb", ATLAS_DATA / "socal_drive_network.fgb"]
+ATLAS_FGBS = [ATLAS_DATA / "norcal_drive_network.fgb", ATLAS_DATA / "socal_drive_network.fgb"]
+TRIMMED_ROADS = DATA_DIR / "roads_near_stops.fgb"   # scripts/trim_roads.py
+ROADS_URL = ("https://storage.googleapis.com/calitp-publish-data-analysis"
+             "/cal-quay/roads_near_stops.fgb")
+DRIVE_FGBS = [TRIMMED_ROADS] if TRIMMED_ROADS.exists() else ATLAS_FGBS
 
 EPS_M = 28.0
 EARTH_R = 6_371_000.0
@@ -168,6 +176,30 @@ def assert_no_cannot_links(df: pd.DataFrame, forbidden_pairs) -> None:
                 f"Cannot-linked rows {i} and {j} in final group {ids.at[i]}")
 
 
+def ensure_roads() -> None:
+    """Resolve road sources; download the trimmed statewide file if none exist.
+
+    No-op when data/roads_near_stops.fgb (or the full atlas pair) is already
+    present — the ~220 MB download happens at most once.
+    """
+    global DRIVE_FGBS
+    if TRIMMED_ROADS.exists():
+        DRIVE_FGBS = [TRIMMED_ROADS]
+        return
+    if all(f.exists() for f in ATLAS_FGBS):
+        DRIVE_FGBS = ATLAS_FGBS
+        return
+    print("  roads: no local road file; downloading roads_near_stops.fgb (~220 MB)")
+    TRIMMED_ROADS.parent.mkdir(parents=True, exist_ok=True)
+    part = TRIMMED_ROADS.with_suffix(".fgb.part")
+    urllib.request.urlretrieve(ROADS_URL, part)
+    n_edges = pyogrio.read_info(part)["features"]   # raises if truncated/corrupt
+    part.rename(TRIMMED_ROADS)
+    print(f"  roads: saved {TRIMMED_ROADS.name} ({n_edges:,} edges, "
+          f"{TRIMMED_ROADS.stat().st_size / 1e6:.0f} MB)")
+    DRIVE_FGBS = [TRIMMED_ROADS]
+
+
 def _read_roads(bbox) -> gpd.GeoDataFrame:
     parts = []
     for f in DRIVE_FGBS:
@@ -300,6 +332,7 @@ def main() -> None:
     ap.add_argument("--output", type=Path, default=DATA_DIR / "canonicalizer_stops_statewide.csv")
     args = ap.parse_args()
 
+    ensure_roads()
     src = args.input or latest_stops()
     df = pd.read_csv(src, dtype={"stop_id": str, "stop_code": str,
                                  "route_dirs": str, "route_ids": str,

@@ -52,8 +52,13 @@ few thousand locations where multiple agencies each publish their own record for
 - **Result:** ~82,474 groups; ~5,700 multi-agency.
 
 ### 3. Canonical pick (OSM-scored, provisional)
-- Per stop (in EPSG:3310, statewide OSM drive networks read **per spatial tile** so 1.8 GB of road
-  geometry is never loaded at once): `dist_to_road_meters`, `in_roadway` (< 3 m).
+- Per stop (in EPSG:3310, OSM road geometry read **per spatial tile**): `dist_to_road_meters`,
+  `in_roadway` (< 3 m).
+- **Road data:** `data/roads_near_stops.fgb` — geometry-only OSM drive-network edges within 150 m
+  of any stop (223 MB vs the 1.8 GB source networks; built by `scripts/trim_roads.py`; decisions
+  verified identical). Auto-downloaded on first run from the public bucket:
+  `https://storage.googleapis.com/calitp-publish-data-analysis/cal-quay/roads_near_stops.fgb`
+  (© OpenStreetMap contributors, ODbL).
 - **Score** = `−10·in_roadway + normalized(service count)`; the highest-scoring **existing** stop
   wins. Demotes stops sitting in the roadway, then prefers the best-served.
 - **Review bucket:** large/ambiguous groups, or groups with no clear pick, are flagged for human
