@@ -56,10 +56,15 @@ To add a fixture, append a ``same(...)`` call to ``SHOULD_MATCH_FIXTURES`` or a
 used in a fixture gets its own line in the report, so categories are the
 quality dimensions you compare algorithms on; invent new ones freely.
 
+    same("Short description", "Category name",
+         ("Agency A Schedule", "stop_123"), ("Agency B Schedule", "9876"),
+         notes="optional: why these are the same stop")
+
 A fixture with any stop missing from the supplied file *fails* (both "should
 match" and "should not match"), since an algorithm's output that drops a stop
-cannot be said to handle it. A fixture with fewer than two stops is not
-populated yet and is reported as *skipped*. A stop that is in the file
+cannot be said to handle it. A fixture that is malformed (fewer than two
+stops, or a stop that is not a pair of strings) raises an error when the
+script starts. A stop that is in the file
 but has a blank ``unique_id`` was left ungrouped by the algorithm: that fails a
 "should match" fixture, and cannot collide in a "should not match" fixture.
 """
@@ -92,6 +97,22 @@ class Fixture:
     stops: List[StopRef]
     notes: str = ""
 
+    def __post_init__(self):
+        """Fail at import time on a malformed fixture rather than mis-grading it."""
+        label = f"fixture {self.name!r}" if isinstance(self.name, str) else "fixture"
+        for attr in ("name", "category", "notes"):
+            if not isinstance(getattr(self, attr), str):
+                raise TypeError(f"{label}: {attr} must be a str, got {type(getattr(self, attr)).__name__}")
+        if not isinstance(self.stops, list):
+            raise TypeError(f"{label}: stops must be a list, got {type(self.stops).__name__}")
+        for stop in self.stops:
+            if not (isinstance(stop, tuple) and len(stop) == 2 and all(isinstance(p, str) for p in stop)):
+                raise TypeError(
+                    f"{label}: each stop must be a (GTFS Schedule Name, GTFS Schedule Stop ID) "
+                    f"tuple of two strings, got {stop!r}")
+        if len(self.stops) < 2:
+            raise ValueError(f"{label}: needs at least 2 stops, got {len(self.stops)}")
+
 
 def same(name: str, category: str, *stops: StopRef, notes: str = "") -> Fixture:
     """Fixture: all of `stops` must be assigned the same unique_id."""
@@ -105,10 +126,8 @@ def different(name: str, category: str, *stops: StopRef, notes: str = "") -> Fix
 
 CALTRANS_CATEGORY = "Caltrans District Focus Stops"
 
-# One entry per Caltrans district. Replace the empty stop list with two or more
-# (GTFS Schedule Name, GTFS Schedule Stop ID) pairs that are physically the same
-# stop and that sit in that district. Until populated, the case is reported as
-# skipped.
+# One entry per Caltrans district: two or more (GTFS Schedule Name, GTFS Schedule
+# Stop ID) pairs that are physically the same stop and sit in that district.
 CALTRANS_DISTRICT_FIXTURES: List[Fixture] = [
     same(
         "District 1 - Eureka (North Coast)", 
@@ -200,24 +219,12 @@ CALTRANS_DISTRICT_FIXTURES: List[Fixture] = [
     ),
 ]
 
-# Stops that must share a unique_id. Template:
-#   same("Short description", "Category name",
-#        ("Agency A Schedule", "stop_123"),
-#        ("Agency B Schedule", "9876"),
-#        notes="why these are the same stop")
+# Stops that must share a unique_id.
 SHOULD_MATCH_FIXTURES: List[Fixture] = [
-    # same("Transfer hub shared by two agencies", "Same stop, different agencies",
-    #      ("Agency A Schedule", "stop_123"), ("Agency B Schedule", "9876")),
-    # same("Duplicate stop record within one feed", "Same stop, same agency",
-    #      ("Agency A Schedule", "stop_123"), ("Agency A Schedule", "stop_123_dup")),
     *CALTRANS_DISTRICT_FIXTURES,
 ]
 
-# Stops that must NOT share a unique_id. Template:
-#   different("Short description", "Category name",
-#             ("Agency A Schedule", "stop_123"),
-#             ("Agency A Schedule", "stop_124"),
-#             notes="why these are different stops")
+# Stops that must NOT share a unique_id.
 SHOULD_NOT_MATCH_FIXTURES: List[Fixture] = [
     different(
         "18th & Castro, San Francisco", 
@@ -535,11 +542,9 @@ def _describe(inputs: Inputs, ref: StopRef) -> str:
 
 
 def _resolve(t: unittest.TestCase, inputs: Inputs, fixture: Fixture) -> List[StopRef]:
-    """Skip if the fixture is unpopulated or the file unusable; fail if any stop is missing from the file."""
+    """Skip if the file is unusable; fail if any stop is missing from the file."""
     if not inputs.usable:
         t.skipTest("input file is not usable (see file format tests)")
-    if len(fixture.stops) < 2:
-        t.skipTest("fixture not populated yet (needs at least 2 stops)")
     refs = [(n.strip(), s.strip()) for n, s in fixture.stops]
     absent = [r for r in refs if r not in inputs.present]
     if absent:
