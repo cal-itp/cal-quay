@@ -56,9 +56,10 @@ To add a fixture, append a ``same(...)`` call to ``SHOULD_MATCH_FIXTURES`` or a
 used in a fixture gets its own line in the report, so categories are the
 quality dimensions you compare algorithms on; invent new ones freely.
 
-A fixture whose stops are not present in the supplied file is reported as
-*skipped* rather than passed or failed, so a run against a partial dataset is
-not silently graded on stops that were never there. A stop that is in the file
+A fixture with any stop missing from the supplied file *fails* (both "should
+match" and "should not match"), since an algorithm's output that drops a stop
+cannot be said to handle it. A fixture with fewer than two stops is not
+populated yet and is reported as *skipped*. A stop that is in the file
 but has a blank ``unique_id`` was left ungrouped by the algorithm: that fails a
 "should match" fixture, and cannot collide in a "should not match" fixture.
 """
@@ -534,7 +535,7 @@ def _describe(inputs: Inputs, ref: StopRef) -> str:
 
 
 def _resolve(t: unittest.TestCase, inputs: Inputs, fixture: Fixture) -> List[StopRef]:
-    """Skip unless the fixture is populated and every stop is in the input file."""
+    """Skip if the fixture is unpopulated or the file unusable; fail if any stop is missing from the file."""
     if not inputs.usable:
         t.skipTest("input file is not usable (see file format tests)")
     if len(fixture.stops) < 2:
@@ -542,7 +543,7 @@ def _resolve(t: unittest.TestCase, inputs: Inputs, fixture: Fixture) -> List[Sto
     refs = [(n.strip(), s.strip()) for n, s in fixture.stops]
     absent = [r for r in refs if r not in inputs.present]
     if absent:
-        t.skipTest("stop(s) not in input file: " + ", ".join(f"{n} / {s}" for n, s in absent))
+        t.fail("stop(s) not in input file: " + ", ".join(f"{n} / {s}" for n, s in absent))
     return refs
 
 
