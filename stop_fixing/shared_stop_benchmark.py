@@ -1,0 +1,739 @@
+#!/usr/bin/env python3
+"""
+Benchmark harness for algorithms that identify shared transit stops.
+
+An algorithm takes raw GTFS Schedule stops and groups the ones that are really
+the same physical stop under one ``unique_id``. This script does not run an
+algorithm. It scores the *output* of one against a set of test cases, so
+different algorithms (or different parameters of one algorithm) can be compared
+on equal terms.
+
+Standard library only; Python 3.8+.
+
+Input
+-----
+One CSV (``--input``) with one row per GTFS Schedule stop, containing:
+
+* the GTFS Schedule feed the stop came from
+* the GTFS Schedule stop ID
+* latitude and longitude
+* the ID of the deduplicated stop the algorithm assigned it to (``unique_id``)
+
+Extra columns are ignored. The actual column headers are mapped to those five
+fields by a JSON config file (``--config``, default: ``shared_stop_benchmark.config.json``
+next to this script; built-in defaults are used if that file does not exist):
+
+    {
+      "columns": {
+        "gtfs_schedule_name": "GTFS Schedule Name",
+        "gtfs_stop_id":       "GTFS Schedule Stop ID",
+        "latitude":           "latitude",
+        "longitude":          "longitude",
+        "unique_id":          "unique_id"
+      }
+    }
+
+Any field left out of the config keeps its default header.
+
+Usage
+-----
+    python shared_stop_benchmark.py --input stops.csv
+    python shared_stop_benchmark.py --input stops.csv --config my_columns.json \
+        --label "geohash-7" --json results/geohash-7.json
+
+Exit status is 0 when nothing failed and 1 otherwise (skipped tests are not
+failures unless ``--fail-on-skipped`` is given), or 2 for a bad config.
+
+Test cases
+----------
+* File format checks for the input (one test per rule).
+* "Should match" fixtures: GTFS stops that must share a ``unique_id``.
+  Includes the "Caltrans District Focus Stops" category (one per district).
+* "Should not match" fixtures: GTFS stops that must NOT share a ``unique_id``.
+
+To add a fixture, append a ``same(...)`` call to ``SHOULD_MATCH_FIXTURES`` or a
+``different(...)`` call to ``SHOULD_NOT_MATCH_FIXTURES`` below. Every category
+used in a fixture gets its own line in the report, so categories are the
+quality dimensions you compare algorithms on; invent new ones freely.
+
+    same("Short description", "Category name",
+         ("Agency A Schedule", "stop_123"), ("Agency B Schedule", "9876"),
+         notes="optional: why these are the same stop")
+
+A fixture with any stop missing from the supplied file *fails* (both "should
+match" and "should not match"), since an algorithm's output that drops a stop
+cannot be said to handle it. A fixture that is malformed (fewer than two
+stops, or a stop that is not a pair of strings) raises an error when the
+script starts. A stop that is in the file
+but has a blank ``unique_id`` was left ungrouped by the algorithm: that fails a
+"should match" fixture, and cannot collide in a "should not match" fixture.
+"""
+
+import argparse
+import csv
+import json
+import math
+import os
+import re
+import sys
+import unittest
+from collections import OrderedDict
+from dataclasses import dataclass, field
+from itertools import combinations
+from typing import Dict, List, Optional, Set, Tuple
+
+# --------------------------------------------------------------------------- #
+# Fixtures - edit this section to add test cases
+# --------------------------------------------------------------------------- #
+
+# A GTFS stop is identified by (GTFS Schedule Name, GTFS Schedule Stop ID).
+StopRef = Tuple[str, str]
+
+
+@dataclass
+class Fixture:
+    name: str
+    category: str
+    stops: List[StopRef]
+    notes: str = ""
+
+    def __post_init__(self):
+        """Fail at import time on a malformed fixture rather than mis-grading it."""
+        label = f"fixture {self.name!r}" if isinstance(self.name, str) else "fixture"
+        for attr in ("name", "category", "notes"):
+            if not isinstance(getattr(self, attr), str):
+                raise TypeError(f"{label}: {attr} must be a str, got {type(getattr(self, attr)).__name__}")
+        if not isinstance(self.stops, list):
+            raise TypeError(f"{label}: stops must be a list, got {type(self.stops).__name__}")
+        for stop in self.stops:
+            if not (isinstance(stop, tuple) and len(stop) == 2 and all(isinstance(p, str) for p in stop)):
+                raise TypeError(
+                    f"{label}: each stop must be a (GTFS Schedule Name, GTFS Schedule Stop ID) "
+                    f"tuple of two strings, got {stop!r}")
+        if len(self.stops) < 2:
+            raise ValueError(f"{label}: needs at least 2 stops, got {len(self.stops)}")
+
+
+def same(name: str, category: str, *stops: StopRef, notes: str = "") -> Fixture:
+    """Fixture: all of `stops` must be assigned the same unique_id."""
+    return Fixture(name, category, list(stops), notes)
+
+
+def different(name: str, category: str, *stops: StopRef, notes: str = "") -> Fixture:
+    """Fixture: every one of `stops` must be assigned a different unique_id."""
+    return Fixture(name, category, list(stops), notes)
+
+
+CALTRANS_CATEGORY = "Caltrans District Focus Stops"
+
+# One entry per Caltrans district: two or more (GTFS Schedule Name, GTFS Schedule
+# Stop ID) pairs that are physically the same stop and sit in that district.
+CALTRANS_DISTRICT_FIXTURES: List[Fixture] = [
+    same(
+        "District 1 - Eureka (North Coast)", 
+        CALTRANS_CATEGORY,
+        ('Humboldt Transit Authority', '1283'), 
+        ('Yurok Tribe', 'bn67'), 
+        ('Trinity Remix Schedule', '4556')
+    ),
+    same(
+        "District 2 - Redding (Northeastern CA)", 
+        CALTRANS_CATEGORY,
+         ('Amtrak', 'RBF'), 
+         ('Redding Area Bus Authority', '9902'), 
+         ('San Joaquin Joint Powers Authority', 'bRBF'), 
+         ('Tehama County', '60')
+    ),
+    same(
+        "District 3 - Marysville (Sacramento Area)", 
+        CALTRANS_CATEGORY,
+         ('City of Elk Grove', '9966'), 
+         ('City of Roseville', '53217'), 
+         ('City of Roseville', '53007'), 
+         ('El Dorado County Transit Authority', '2745554'), 
+         ('Placer County', '6010'),
+         ('Yolo County Transportation District', '23414'),
+         ('Yuba-Sutter Transit Authority', '206338'),
+         ('Yuba-Sutter Transit Authority', '12408')
+    ),
+    same(
+        "District 4 - Oakland (Bay Area)", 
+        CALTRANS_CATEGORY,
+        ('Alameda-Contra Costa Transit District', '51397'),
+        ('Stanford University', '154')
+    ),
+    same(
+        "District 5 - San Luis Obispo (Central Coast)", 
+        CALTRANS_CATEGORY,
+        ('City of Lompoc', '3740'),
+        ('City of Santa Maria', '2973e49c-465b-498f-91de-6d58ba0a5839'),
+        ('City of Solvang', 'exp_04')
+    ),
+    same(
+        "District 6 - Fresno (Central Valley)", 
+        CALTRANS_CATEGORY,
+        ('FlixBus and Greyhound', '7d2e6c99-dc26-4de7-9095-f675fcf55339'),
+        ('Madera County', '20548')
+    ),
+    same(
+        "District 7 - Los Angeles", 
+        CALTRANS_CATEGORY,
+        ('Orange County Transportation Authority', '1040'),
+        ('Long Beach Transit', '1916'),
+        ('Los Angeles County Metropolitan Transportation Authority', '2292')
+    ),
+    same(
+        "District 8 - San Bernardino (Inland Empire)", 
+        CALTRANS_CATEGORY,
+        ('City of Banning', '11583'),
+        ('City of Beaumont', '11677'),
+        ('Riverside Transit Agency', '1829'),
+        ('SunLine Transit Agency', '11130190')
+    ),
+    same(
+        "District 9 - Bishop (Eastern Sierra)", 
+        CALTRANS_CATEGORY,
+        ('City of Ridgecrest', '2619652'),
+        ('Eastern Sierra Transit Authority', '2501531'),
+        ('Kern County', '771460')
+    ),
+    same(
+        "District 10 - Stockton (Central Sierra / San Joaquin)", 
+        CALTRANS_CATEGORY,
+        ('City of Turlock', '2615945'),
+        ('Stanislaus Regional Transit Authority', '931'),
+        ('Transit Joint Powers Authority for Merced County', '474921')
+    ),
+    same(
+        "District 11 - San Diego", 
+        CALTRANS_CATEGORY,
+        ('University of California, San Diego', '11852'),
+        ('San Diego Metropolitan Transit System, Airport, Flagship Cruises', '11852')
+    ),
+    same(
+        "District 12 - Irvine (Orange County)", 
+        CALTRANS_CATEGORY,
+        ('City of Dana Point', '194172'),
+        ('City of Laguna Beach', '2751734'),
+        ('Orange County Transportation Authority', '1509')
+    ),
+]
+
+# Stops that must share a unique_id.
+SHOULD_MATCH_FIXTURES: List[Fixture] = [
+    *CALTRANS_DISTRICT_FIXTURES,
+]
+
+# Stops that must NOT share a unique_id.
+SHOULD_NOT_MATCH_FIXTURES: List[Fixture] = [
+    different(
+        "18th & Castro, San Francisco", 
+        "Stops on same corner or intersection, but on different roads",
+        ("City and County of San Francisco", "13326"), 
+        ("City and County of San Francisco", "14314")
+    ),
+    different(
+        "18th & Eureka, San Francisco", 
+        "Stops on same street, but on different side of street",
+        ("City and County of San Francisco", "13332"), 
+        ("City and County of San Francisco", "14535")
+    ),
+    different(
+        "Consumnes River College, Sacramento", 
+        "Rail-only and Bus-only Platforms should be separate",
+        ("Sacramento Regional Transit District", "906"), 
+        ("Sacramento Regional Transit District", "7097")
+    ), 
+]
+
+# --------------------------------------------------------------------------- #
+# Column mapping config and file loading
+# --------------------------------------------------------------------------- #
+
+DEFAULT_CONFIG_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "shared_stop_benchmark.config.json"
+)
+
+# logical field -> default header in the input CSV
+DEFAULT_COLUMNS = OrderedDict([
+    ("gtfs_schedule_name", "GTFS Schedule Name"),
+    ("gtfs_stop_id", "GTFS Schedule Stop ID"),
+    ("latitude", "latitude"),
+    ("longitude", "longitude"),
+    ("unique_id", "unique_id"),
+])
+
+MAX_ROW_ERRORS_SHOWN = 5
+_DECIMAL_RE = re.compile(r"^[+-]?(\d+(\.\d*)?|\.\d+)$")
+
+
+class ConfigError(Exception):
+    pass
+
+
+@dataclass
+class Columns:
+    """The input CSV headers that hold each logical field."""
+    gtfs_schedule_name: str
+    gtfs_stop_id: str
+    latitude: str
+    longitude: str
+    unique_id: str
+
+    def all(self) -> List[str]:
+        return [getattr(self, f) for f in DEFAULT_COLUMNS]
+
+
+def load_columns(config_path: Optional[str]) -> Columns:
+    """Read the column mapping from a JSON config; unspecified fields keep defaults.
+
+    With no explicit path, the default config beside this script is used if it
+    exists, otherwise the built-in defaults.
+    """
+    mapping = dict(DEFAULT_COLUMNS)
+    path = config_path or (DEFAULT_CONFIG_PATH if os.path.exists(DEFAULT_CONFIG_PATH) else None)
+    if path:
+        try:
+            with open(path, encoding="utf-8") as handle:
+                config = json.load(handle)
+        except OSError as exc:
+            raise ConfigError(f"cannot read config {path}: {exc}")
+        except ValueError as exc:
+            raise ConfigError(f"config {path} is not valid JSON: {exc}")
+        overrides = config.get("columns", {}) if isinstance(config, dict) else None
+        if not isinstance(overrides, dict):
+            raise ConfigError(f'config {path} must be an object with an optional "columns" object')
+        unknown = sorted(set(overrides) - set(DEFAULT_COLUMNS))
+        if unknown:
+            raise ConfigError(
+                f"config {path} has unknown column field(s) {unknown}; valid fields: {list(DEFAULT_COLUMNS)}")
+        for field_name, header in overrides.items():
+            if not isinstance(header, str) or not header.strip():
+                raise ConfigError(f"config {path}: columns.{field_name} must be a non-empty string")
+            mapping[field_name] = header.strip()
+    headers = list(mapping.values())
+    if len(set(headers)) != len(headers):
+        raise ConfigError(f"each field must map to a different header, got: {mapping}")
+    return Columns(**mapping)
+
+
+@dataclass
+class FileData:
+    path: str
+    header: List[str] = field(default_factory=list)
+    rows: List[Dict[str, Optional[str]]] = field(default_factory=list)
+    load_error: Optional[str] = None
+
+
+def load_csv(path: str) -> FileData:
+    data = FileData(path)
+    try:
+        # utf-8-sig so a BOM from Excel doesn't corrupt the first header name.
+        with open(path, newline="", encoding="utf-8-sig") as handle:
+            reader = csv.DictReader(handle)
+            data.header = [h.strip() for h in (reader.fieldnames or [])]
+            reader.fieldnames = data.header
+            data.rows = list(reader)
+    except FileNotFoundError:
+        data.load_error = f"file not found: {path}"
+    except (OSError, UnicodeDecodeError, csv.Error) as exc:
+        data.load_error = f"could not read as CSV: {exc}"
+    return data
+
+
+def is_blank(value: Optional[str]) -> bool:
+    return value is None or value.strip() == ""
+
+
+def coordinate_error(value: Optional[str], low: float, high: float) -> Optional[str]:
+    """Return a problem description, or None if value is a decimal in [low, high]."""
+    if is_blank(value):
+        return "blank"
+    text = value.strip()
+    if not _DECIMAL_RE.match(text):
+        return f"not a decimal number: {text!r}"
+    number = float(text)
+    if not low <= number <= high:
+        return f"out of range [{low:g}, {high:g}]: {text}"
+    return None
+
+
+def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    r = 6371008.8
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    a = (
+        math.sin((p2 - p1) / 2) ** 2
+        + math.cos(p1) * math.cos(p2) * math.sin(math.radians(lon2 - lon1) / 2) ** 2
+    )
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+class Inputs:
+    """The input file, its column mapping, and a lookup from GTFS stop -> assigned unique_ids.
+
+    `present` is every stop in the file; `ids` only has the stops that were given
+    a unique_id. A present stop with no entry in `ids` was left unassigned by the
+    algorithm, which is different from the stop not being in the file at all.
+    """
+
+    def __init__(self, data: FileData, columns: Columns):
+        self.data = data
+        self.columns = columns
+        self.present: Set[StopRef] = set()
+        self.ids: Dict[StopRef, Set[str]] = {}
+        self.coords: Dict[StopRef, Tuple[float, float]] = {}
+        if self.usable:
+            c = columns
+            for row in data.rows:
+                if any(is_blank(row.get(h)) for h in (c.gtfs_schedule_name, c.gtfs_stop_id)):
+                    continue
+                ref = (row[c.gtfs_schedule_name].strip(), row[c.gtfs_stop_id].strip())
+                self.present.add(ref)
+                if not is_blank(row.get(c.unique_id)):
+                    self.ids.setdefault(ref, set()).add(row[c.unique_id].strip())
+                if not coordinate_error(row.get(c.latitude), -90, 90) and not coordinate_error(
+                    row.get(c.longitude), -180, 180
+                ):
+                    self.coords[ref] = (float(row[c.latitude]), float(row[c.longitude]))
+
+    @property
+    def usable(self) -> bool:
+        return self.data.load_error is None and all(h in self.data.header for h in self.columns.all())
+
+    def spread_m(self, refs: List[StopRef]) -> Optional[float]:
+        """Largest distance between any two of refs, if coordinates are known."""
+        points = [self.coords[r] for r in refs if r in self.coords]
+        if len(points) < 2:
+            return None
+        return max(haversine_m(*a, *b) for a, b in combinations(points, 2))
+
+
+# --------------------------------------------------------------------------- #
+# Test framework: unittest cases carrying a category, collected by a custom result
+# --------------------------------------------------------------------------- #
+
+class BenchmarkTest(unittest.TestCase):
+    """A single named, categorised check. `check(test)` fails/skips via self."""
+
+    def __init__(self, category: str, name: str, check):
+        super().__init__("runTest")
+        self.category = category
+        self.name = name
+        self._check = check
+
+    def runTest(self):
+        self._check(self)
+
+    def id(self):
+        return f"{self.category} :: {self.name}"
+
+    def shortDescription(self):
+        return self.name
+
+
+@dataclass
+class Outcome:
+    category: str
+    name: str
+    status: str  # "passed" | "failed" | "skipped"
+    message: str = ""
+
+
+class BenchmarkResult(unittest.TestResult):
+    def __init__(self):
+        super().__init__()
+        self.outcomes: List[Outcome] = []
+
+    def _record(self, test, status, message=""):
+        self.outcomes.append(Outcome(test.category, test.name, status, message))
+
+    def addSuccess(self, test):
+        super().addSuccess(test)
+        self._record(test, "passed")
+
+    def addFailure(self, test, err):
+        super().addFailure(test, err)
+        self._record(test, "failed", str(err[1]))
+
+    def addError(self, test, err):
+        super().addError(test, err)
+        self._record(test, "failed", f"unexpected error: {err[0].__name__}: {err[1]}")
+
+    def addSkip(self, test, reason):
+        super().addSkip(test, reason)
+        self._record(test, "skipped", reason)
+
+
+def _fmt_row_errors(errors: List[str], total: int) -> str:
+    shown = "; ".join(errors[:MAX_ROW_ERRORS_SHOWN])
+    more = f" (+{total - MAX_ROW_ERRORS_SHOWN} more)" if total > MAX_ROW_ERRORS_SHOWN else ""
+    return f"{total} bad row(s): {shown}{more}"
+
+
+# ---- file format tests ----------------------------------------------------- #
+
+def _readable_check(data: FileData):
+    def check(t: unittest.TestCase):
+        if data.load_error:
+            t.fail(data.load_error)
+        if not data.header:
+            t.fail("file is empty (no header row)")
+        if not data.rows:
+            t.fail("file has a header but no data rows")
+    return check
+
+
+def _header_check(data: FileData, required: List[str]):
+    def check(t: unittest.TestCase):
+        if data.load_error:
+            t.skipTest("file could not be read")
+        missing = [c for c in required if c not in data.header]
+        if missing:
+            t.fail(f"missing column(s): {', '.join(missing)}; found: {', '.join(data.header)}")
+    return check
+
+
+def _column_check(data: FileData, column: str, validate):
+    """Apply validate(value) -> error|None to every row of `column`."""
+    def check(t: unittest.TestCase):
+        if data.load_error or column not in data.header:
+            t.skipTest(f"column {column!r} unavailable (see header test)")
+        errors = []
+        for line, row in enumerate(data.rows, start=2):  # line 1 is the header
+            problem = validate(row.get(column))
+            if problem:
+                errors.append(f"line {line}: {problem}")
+        if errors:
+            t.fail(_fmt_row_errors(errors, len(errors)))
+    return check
+
+
+def _not_blank(value: Optional[str]) -> Optional[str]:
+    return "blank" if is_blank(value) else None
+
+
+def _lat(value: Optional[str]) -> Optional[str]:
+    return coordinate_error(value, -90, 90)
+
+
+def _lon(value: Optional[str]) -> Optional[str]:
+    return coordinate_error(value, -180, 180)
+
+
+def format_tests(inputs: Inputs) -> List[BenchmarkTest]:
+    category = "File format"
+    data, c = inputs.data, inputs.columns
+    tests = [
+        BenchmarkTest(category, "File is a readable, non-empty CSV", _readable_check(data)),
+        BenchmarkTest(category, f"Header has columns {c.all()}", _header_check(data, c.all())),
+    ]
+    for header in (c.gtfs_schedule_name, c.gtfs_stop_id, c.unique_id):
+        tests.append(BenchmarkTest(category, f"'{header}' is never blank", _column_check(data, header, _not_blank)))
+    tests.append(BenchmarkTest(category, f"'{c.latitude}' is a decimal in [-90, 90] for every record", _column_check(data, c.latitude, _lat)))
+    tests.append(BenchmarkTest(category, f"'{c.longitude}' is a decimal in [-180, 180] for every record", _column_check(data, c.longitude, _lon)))
+    return tests
+
+
+# ---- fixture tests --------------------------------------------------------- #
+
+def _describe(inputs: Inputs, ref: StopRef) -> str:
+    ids = inputs.ids.get(ref)
+    return f"{ref[0]} / {ref[1]} -> {', '.join(sorted(ids)) if ids else '(no unique_id)'}"
+
+
+def _resolve(t: unittest.TestCase, inputs: Inputs, fixture: Fixture) -> List[StopRef]:
+    """Skip if the file is unusable; fail if any stop is missing from the file."""
+    if not inputs.usable:
+        t.skipTest("input file is not usable (see file format tests)")
+    refs = [(n.strip(), s.strip()) for n, s in fixture.stops]
+    absent = [r for r in refs if r not in inputs.present]
+    if absent:
+        t.fail("stop(s) not in input file: " + ", ".join(f"{n} / {s}" for n, s in absent))
+    return refs
+
+
+def _match_breakdown(inputs: Inputs, refs: List[StopRef]) -> str:
+    """Multi-line summary of which stops shared a unique_id and which did not."""
+    by_id: "OrderedDict[str, List[StopRef]]" = OrderedDict()
+    unassigned, ambiguous = [], []
+    for r in refs:
+        ids = inputs.ids.get(r, set())
+        if not ids:
+            unassigned.append(r)
+        elif len(ids) > 1:
+            ambiguous.append(r)
+        else:
+            by_id.setdefault(next(iter(ids)), []).append(r)
+
+    def stops(rs):
+        return "; ".join(f"{n} / {s}" for n, s in rs)
+
+    matched = [(i, rs) for i, rs in by_id.items() if len(rs) > 1]
+    alone = [(i, rs) for i, rs in by_id.items() if len(rs) == 1]
+    lines = []
+    if matched:
+        lines.append("matched (same unique_id):")
+        lines += [f"  {i}: {stops(rs)}" for i, rs in matched]
+    if alone or unassigned or ambiguous:
+        lines.append("not matched:")
+        lines += [f"  {i}: {stops(rs)}" for i, rs in alone]
+        lines += [f"  (no unique_id): {stops([r])}" for r in unassigned]
+        lines += [f"  (multiple unique_ids {', '.join(sorted(inputs.ids[r]))}): {stops([r])}" for r in ambiguous]
+    return "\n".join(lines)
+
+
+def _same_check(inputs: Inputs, fixture: Fixture):
+    def check(t: unittest.TestCase):
+        refs = _resolve(t, inputs, fixture)
+        all_ids = set().union(*(inputs.ids.get(r, set()) for r in refs))
+        unassigned = [r for r in refs if r not in inputs.ids]
+        multi = [r for r in refs if len(inputs.ids.get(r, ())) > 1]
+        if not (unassigned or multi or len(all_ids) > 1):
+            return
+        matched_n = max(
+            (sum(1 for r in refs if inputs.ids.get(r) == {i}) for i in all_ids), default=0)
+        headline = f"expected all {len(refs)} stops to share one unique_id; largest matching group is {matched_n}"
+        spread = inputs.spread_m(refs)
+        if spread is not None:
+            headline += f" (stops are up to {spread:.0f} m apart)"
+        t.fail(headline + "\n" + _match_breakdown(inputs, refs))
+    return check
+
+
+def _different_check(inputs: Inputs, fixture: Fixture):
+    def check(t: unittest.TestCase):
+        refs = _resolve(t, inputs, fixture)
+        multi = [r for r in refs if len(inputs.ids.get(r, ())) > 1]
+        if multi:
+            t.fail("stop has more than one unique_id in file: " + "; ".join(_describe(inputs, r) for r in multi))
+        # A stop with no unique_id is not grouped with anything, so it cannot collide.
+        collisions = [
+            (a, b) for a, b in combinations(refs, 2) if inputs.ids.get(a, set()) & inputs.ids.get(b, set())
+        ]
+        if collisions:
+            parts = []
+            for a, b in collisions:
+                spread = inputs.spread_m([a, b])
+                dist = f", {spread:.0f} m apart" if spread is not None else ""
+                parts.append(f"{a[0]} / {a[1]} and {b[0]} / {b[1]} share {', '.join(sorted(inputs.ids[a] & inputs.ids[b]))}{dist}")
+            t.fail("expected distinct unique_ids but " + "; ".join(parts))
+    return check
+
+
+def fixture_tests(inputs: Inputs) -> List[BenchmarkTest]:
+    tests = []
+    for fx in SHOULD_MATCH_FIXTURES:
+        tests.append(BenchmarkTest(f"Should match: {fx.category}", fx.name, _same_check(inputs, fx)))
+    for fx in SHOULD_NOT_MATCH_FIXTURES:
+        tests.append(BenchmarkTest(f"Should not match: {fx.category}", fx.name, _different_check(inputs, fx)))
+    return tests
+
+
+def build_suite(inputs: Inputs) -> unittest.TestSuite:
+    return unittest.TestSuite(format_tests(inputs) + fixture_tests(inputs))
+
+
+# --------------------------------------------------------------------------- #
+# Reporting
+# --------------------------------------------------------------------------- #
+
+def _rate(passed: int, failed: int) -> str:
+    graded = passed + failed
+    return f"{100 * passed / graded:.1f}%" if graded else "n/a"
+
+
+def summarise(outcomes: List[Outcome]):
+    totals = {"passed": 0, "failed": 0, "skipped": 0}
+    by_category: "OrderedDict[str, Dict[str, int]]" = OrderedDict()
+    for o in outcomes:
+        totals[o.status] += 1
+        by_category.setdefault(o.category, {"passed": 0, "failed": 0, "skipped": 0})[o.status] += 1
+    return totals, by_category
+
+
+def print_report(outcomes: List[Outcome], label: str, input_path: str, columns: Columns, verbose: bool) -> None:
+    totals, by_category = summarise(outcomes)
+    total = len(outcomes)
+    bar = "=" * 78
+    print(bar)
+    print(f"Shared stop benchmark: {label}")
+    print(f"  input: {input_path}")
+    print("  columns: " + ", ".join(f"{k} = {getattr(columns, k)!r}" for k in DEFAULT_COLUMNS))
+    print(bar)
+    print(
+        f"OVERALL  {total} tests | {totals['passed']} passed | {totals['failed']} failed | "
+        f"{totals['skipped']} skipped | pass rate {_rate(totals['passed'], totals['failed'])} (skipped excluded)"
+    )
+    print()
+    width = max([len("Category")] + [len(c) for c in by_category])
+    print(f"{'Category'.ljust(width)}  {'Pass':>5} {'Fail':>5} {'Skip':>5} {'Rate':>7}")
+    print(f"{'-' * width}  {'-' * 5} {'-' * 5} {'-' * 5} {'-' * 7}")
+    for category, c in by_category.items():
+        print(f"{category.ljust(width)}  {c['passed']:>5} {c['failed']:>5} {c['skipped']:>5} {_rate(c['passed'], c['failed']):>7}")
+
+    failures = [o for o in outcomes if o.status == "failed"]
+    if failures:
+        print("\nFAILURES")
+        for o in failures:
+            print(f"  [{o.category}] {o.name}\n      " + o.message.replace("\n", "\n      "))
+    skipped = [o for o in outcomes if o.status == "skipped"]
+    if skipped and verbose:
+        print("\nSKIPPED")
+        for o in skipped:
+            print(f"  [{o.category}] {o.name}\n      {o.message}")
+    elif skipped:
+        print(f"\n{len(skipped)} test(s) skipped; rerun with --verbose to see why.")
+    print()
+
+
+def write_json(path: str, outcomes: List[Outcome], label: str, input_path: str, columns: Columns) -> None:
+    totals, by_category = summarise(outcomes)
+    payload = {
+        "label": label,
+        "input": input_path,
+        "columns": {k: getattr(columns, k) for k in DEFAULT_COLUMNS},
+        "overall": {**totals, "total": len(outcomes)},
+        "categories": by_category,
+        "tests": [o.__dict__ for o in outcomes],
+    }
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+        handle.write("\n")
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Benchmark a shared transit stop identification algorithm against test cases.")
+    parser.add_argument("--input", required=True,
+                        help="CSV with one row per GTFS Schedule stop and the unique_id it was assigned")
+    parser.add_argument("--config", metavar="PATH",
+                        help="JSON file mapping input column headers (default: shared_stop_benchmark.config.json "
+                             "beside this script, if present)")
+    parser.add_argument("--label", default="unnamed algorithm", help="name of the algorithm being tested, shown in the report")
+    parser.add_argument("--json", metavar="PATH", help="also write machine-readable results here")
+    parser.add_argument("--verbose", "-v", action="store_true", help="list skipped tests and why")
+    parser.add_argument("--fail-on-skipped", action="store_true", help="exit non-zero if any test was skipped")
+    args = parser.parse_args(argv)
+
+    try:
+        columns = load_columns(args.config)
+    except ConfigError as exc:
+        print(f"config error: {exc}", file=sys.stderr)
+        return 2
+
+    inputs = Inputs(load_csv(args.input), columns)
+    result = BenchmarkResult()
+    build_suite(inputs).run(result)
+
+    print_report(result.outcomes, args.label, args.input, columns, args.verbose)
+    if args.json:
+        write_json(args.json, result.outcomes, args.label, args.input, columns)
+
+    totals, _ = summarise(result.outcomes)
+    if totals["failed"] or (args.fail_on_skipped and totals["skipped"]):
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
