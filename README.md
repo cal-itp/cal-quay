@@ -7,34 +7,45 @@ physical transit stop one canonical identity and universal ID by **June 1, 2027*
 §14113). TDA-funded operators must then conform their stop names/locations to the registry and
 use its identifiers by **Jan 1, 2028** (Pub. Util. Code §99150.5).
 
-## `stop_fixing/`
+## `scripts/`
 
-Tools for sizing and working through the matching problem — the stops where multiple agencies
-each publish their own entry for the same physical place.
-
-### `count_stop_areas.py`
-
-Sizes the multi-agency overlap: how many **stop areas actually need analysis** vs. how many are
-single-agency stops that just need an ID minted. It pulls current stops live from BigQuery,
-clusters them by ground distance, removes protected single-operator rail, the 511 regional
-aggregator's duplicates, and major stations, then counts the multi-agency clusters that remain.
-
-It builds on [`cal-itp/transit-amenity-atlas`](https://github.com/cal-itp/transit-amenity-atlas)
-(the canonicalizer's `cluster.py` and `exclusions.py` are the single source of truth for the
-clustering and exclusion rules).
+Two tools for sizing the matching problem — the stops where multiple agencies each publish their
+own entry for the same physical place. Run with [uv](https://docs.astral.sh/uv/): `uv sync` once,
+then `uv run scripts/<name>.py`.
 
 ```bash
 gcloud auth application-default login                    # cal-itp-data-infra access
-export CALQUAY_ATLAS_STOP_IDS=~/github/transit-amenity-atlas/stop_ids
-python stop_fixing/count_stop_areas.py                   # live pull, ~1 min
-python stop_fixing/count_stop_areas.py --cache data/stops_live_2026_06_03.csv  # re-use a pull
+uv sync                                                  # one-time: create the env
+
+uv run scripts/pull_stops.py --dry-run                   # ~3 GB scan — check first
+uv run scripts/pull_stops.py                             # pulls once, reprocesses locally after
+uv run scripts/find_shared_stops.py
 ```
 
-Outputs (written to `data/`, gitignored):
-- `stops_live_<date>.csv` — the raw BigQuery pull (cache for re-runs)
-- `stop_areas_to_analyze_<date>.csv` — the in-scope multi-agency clusters, the input to the
-  review workflow
+### `pull_stops.py`
+The full list of current California GTFS stops, minus the obvious out-of-scope rows: the latest
+month of *served* stops from `mart_gtfs_rollup.fct_monthly_scheduled_stops` (more complete on
+feeds than `dim_stops_latest`, which silently drops feeds on its `_is_current` join), excluding
+the Bay Area 511 regional aggregator's duplicate copies, Regional Precursor Feeds (an operator's
+direct feed that 511/VCTC re-publishes — kept only when it's the operator's sole feed), rail-only
+stations (by GTFS `route_type`), and exact same-stop duplicates published under two dataset
+names. Two stages: the raw query result is saved to `stops_raw_<YYYY_MM>.parquet`, and the
+exclusions run as a separate local step — re-running the script reprocesses the raw file without
+touching BigQuery (`--refresh` forces a new pull).
 
-**Known limitation:** `analysis_name` is feed-level, so light rail bundled inside a mixed agency
-(Muni Metro, VTA LRT, LA Metro Rail, SD Trolley, Sac RT) is not yet excluded — that needs GTFS
-`route_type`.
+### `find_shared_stops.py`
+Groups the pulled stops by geohash cell (default precision 8, ~38 m × 19 m — "the same corner")
+and keeps cells where **two or more agencies** each have a stop: the candidate shared stops the
+registry needs to consolidate. Geohashes come precomputed from BigQuery's `ST_GEOHASH` in the
+pull (precisions 7/8/9, matching `transit-amenity-atlas`), so `--precision` switches cell size
+without re-pulling.
+
+Both write to `data/` (gitignored): a `<name>_<date>.csv` plus `.gpkg` (QGIS + ArcGIS Pro) and
+`.fgb` (QGIS-native; ArcGIS via Data Interoperability) point layers.
+
+**Known limitations of the first pass:** a single geohash cell can hold two genuinely distinct
+stops (opposite curbs), and shared stops that straddle a cell boundary are missed — notably,
+a badly mispositioned stop (e.g. an agency's coordinate ~100 ft off the shared pole) often lands
+in a *different* cell from its partners, so the worst position errors are underrepresented here.
+Catching those is the position-accuracy analysis (next deliverable), which needs distance-based
+matching rather than cell binning.

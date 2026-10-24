@@ -1,0 +1,15 @@
+[project]
+name = "cal-quay"
+version = "0.1.0"
+description = "Transit stops quality analysis"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "google-cloud-bigquery>=3.20",
+    "db-dtypes>=1.2",
+    "pandas>=2.1",
+    "geopandas>=1.0",
+    "pyogrio>=0.9",
+]
+
+# Run scripts with:  uv run scripts/<name>.py
