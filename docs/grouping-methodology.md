@@ -24,7 +24,8 @@ few thousand locations where multiple agencies each publish their own record for
   (`mart_gtfs_rollup.fct_monthly_scheduled_stops`, Sept 2026 — served stops with
   `route_type_array` / `route_id_array` / arrivals) **unioned with** `dim_stops_latest` (unserved
   `stops.txt` entries, station/entrance records, feeds missing from the rollup).
-- **Geohashes** (levels 7/8/9) computed in SQL via `ST_GEOHASH`.
+- **Geohashes** (levels 7/8/9) computed in SQL via `ST_GEOHASH`, carried as reference columns
+  only — grouping is distance-based (step 2) and does not use them.
 - **Direction data:** per-stop `{route_id|direction_id}` sets from `dim_stop_times ⋈ dim_trips`
   over a 45-day feed-version window, joined on `(base64_url, stop_id)` → the `route_dirs` column.
 - **Exclusions:** the Bay Area 511 regional aggregator; regional precursor (re-published) feeds;
