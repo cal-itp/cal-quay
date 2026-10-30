@@ -31,6 +31,11 @@ Exclusions:
     (e.g. Santa Cruz METRO).
   - rail-only stops: route_types within {0 tram/light rail, 1 subway, 2 rail} —
     stations, not curbside stops. Stops also served by bus are kept.
+  - non-boardable records: GTFS location_type 1 (station), 2 (entrance/exit),
+    3 (generic node), 4 (boarding area). Structural nodes from the current
+    extract (all unserved), not curbside stops; without this they leak into
+    bus groups and get picked as canonical primaries (e.g. a BART station
+    entrance). Rail station hierarchy is handled separately (issue C17).
   - exact duplicates: the same stop (identical stop_id + name + coordinates)
     published under two dataset names for one operator (e.g. a legacy feed and
     its vendor replacement, both without an analysis_name mapping). One row is
@@ -397,12 +402,20 @@ def process(raw_path: Path, outdir: Path) -> None:
 
     dup_511 = stops["feed_name"].isin(EXCLUDE_FEEDS)
     rail = stops["route_types"].map(_rail_only)
+    # non-boardable records: GTFS location_type 1 station / 2 entrance-exit /
+    # 3 generic node / 4 boarding area — structural nodes from the current
+    # extract (all served_in_month=False), not curbside stops. Keep only
+    # platforms/stops (location_type 0 or blank); without this, station
+    # entrances leak into bus groups and get picked as canonical primaries
+    # (e.g. BART "MONT_4" Montgomery entrance). Rail station hierarchy is a
+    # separate track — see issue C17.
+    non_boardable = pd.to_numeric(stops["location_type"], errors="coerce").isin([1, 2, 3, 4])
     # a precursor feed duplicates its 511/VCTC re-publication — drop it, unless
     # it's the operator's only feed in the pull (then it IS the source)
     precursor = stops["regional_feed_type"] == "Regional Precursor Feed"
     label_has_other = (~precursor).groupby(stops["analysis_name"]).transform("any")
     dup_precursor = precursor & label_has_other
-    stops = stops[~dup_511 & ~rail & ~dup_precursor]
+    stops = stops[~dup_511 & ~rail & ~dup_precursor & ~non_boardable]
 
     # same stop under two dataset names -> keep one, preferring a mapped agency
     # label over the raw "<feed> Schedule" fallback (fallback <=> names equal)
@@ -432,6 +445,7 @@ def process(raw_path: Path, outdir: Path) -> None:
         f"latest-extract-only (unserved / stations / missing feeds); excluding "
         f"{dup_511.sum():,} 511-regional duplicates + "
         f"{dup_precursor.sum():,} precursor-feed duplicates + {rail.sum():,} rail-only + "
+        f"{non_boardable.sum():,} non-boardable (entrance/station/node) + "
         f"{dup_exact.sum():,} exact cross-feed duplicates "
         f"-> {len(stops):,} stops across {stops['analysis_name'].nunique()} agencies"
     )
