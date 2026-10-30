@@ -447,7 +447,7 @@ def process(raw_path: Path, outdir: Path) -> None:
     gdf.to_file(gpkg_out, layer="stops", driver="GPKG")
     gdf.to_file(fgb_out, driver="FlatGeobuf")
 
-    print(f"  CSV        -> {csv_out}  (feed to: find_shared_stops.py)")
+    print(f"  CSV        -> {csv_out}  (feed to: cluster_stops.py)")
     print(f"  GeoPackage -> {gpkg_out}  (QGIS + ArcGIS)")
     print(f"  FlatGeobuf -> {fgb_out}  (QGIS; ArcGIS via Data Interop)")
 
