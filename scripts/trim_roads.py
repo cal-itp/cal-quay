@@ -24,23 +24,27 @@ import pandas as pd
 import shapely
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+DATA_DIR = REPO_ROOT / "data"
 ATLAS_DATA = Path.home() / "github/transit-amenity-atlas/data"
 SOURCE_FGBS = [ATLAS_DATA / "norcal_drive_network.fgb",
                ATLAS_DATA / "socal_drive_network.fgb"]
-STOPS_CSV = REPO_ROOT / "data" / "stops_2026_09.csv"
-OUT = REPO_ROOT / "data" / "roads_near_stops.fgb"
+OUT = DATA_DIR / "roads_near_stops.fgb"
 BUFFER_M = 150.0
 CA_ALBERS = "EPSG:3310"
 
 
 def main() -> None:
-    stops = pd.read_csv(STOPS_CSV, usecols=["stop_lat", "stop_lon"])
+    hits = sorted(DATA_DIR.glob("stops_[0-9]*.csv"))
+    if not hits:
+        raise SystemExit("No data/stops_<YYYY_MM>.csv — run pull_stops.py first.")
+    stops_csv = hits[-1]
+    stops = pd.read_csv(stops_csv, usecols=["stop_lat", "stop_lon"])
     buffers = (
         gpd.GeoSeries(gpd.points_from_xy(stops["stop_lon"], stops["stop_lat"]),
                       crs="EPSG:4326")
         .to_crs(CA_ALBERS).buffer(BUFFER_M).to_crs("EPSG:4326")
     )
-    print(f"{len(stops):,} stops -> {BUFFER_M:.0f} m buffers")
+    print(f"{stops_csv.name}: {len(stops):,} stops -> {BUFFER_M:.0f} m buffers")
 
     parts = []
     for f in SOURCE_FGBS:

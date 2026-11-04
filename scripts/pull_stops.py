@@ -320,7 +320,7 @@ def pull_raw(outdir: Path) -> Path:
     monthly["source"] = "rollup"
     latest["source"] = "latest"
     df = pd.concat([monthly, latest], ignore_index=True)
-    print(f"Querying BigQuery: dim_stop_times ⋈ dim_trips "
+    print(f"Querying BigQuery: dim_stop_times JOIN dim_trips "
           f"(per-stop route/direction, {DIR_WINDOW_DAYS}d window)...")
     directions = client.query(SQL_DIRECTIONS).to_dataframe()
     df = df.merge(directions, on=["base64_url", "stop_id"], how="left")

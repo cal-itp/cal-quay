@@ -207,7 +207,9 @@ def _read_roads(bbox) -> gpd.GeoDataFrame:
             continue
         try:
             r = gpd.read_file(f, bbox=tuple(bbox), engine="pyogrio")
-        except Exception:
+        except Exception as e:
+            print(f"  WARNING: road read failed for {f.name} at bbox {tuple(bbox)}: "
+                  f"{e}; proceeding without roads here (direction-only split)")
             continue
         if len(r):
             parts.append(r[["geometry"]])
