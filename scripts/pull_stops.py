@@ -411,9 +411,13 @@ def process(raw_path: Path, outdir: Path) -> None:
     # separate track — see issue C17.
     non_boardable = pd.to_numeric(stops["location_type"], errors="coerce").isin([1, 2, 3, 4])
     # a precursor feed duplicates its 511/VCTC re-publication — drop it, unless
-    # it's the operator's only feed in the pull (then it IS the source)
+    # it's the operator's only SURVIVING feed in the pull (then it IS the source).
+    # "has another feed" is judged among rows that survive the other exclusions,
+    # else an operator whose other feed is all rail/511/non-boardable would lose
+    # both copies (review finding; no-op on current data, fixed defensively)
     precursor = stops["regional_feed_type"] == "Regional Precursor Feed"
-    label_has_other = (~precursor).groupby(stops["analysis_name"]).transform("any")
+    survives_other = ~dup_511 & ~rail & ~non_boardable & ~precursor
+    label_has_other = survives_other.groupby(stops["analysis_name"]).transform("any")
     dup_precursor = precursor & label_has_other
     stops = stops[~dup_511 & ~rail & ~dup_precursor & ~non_boardable]
 

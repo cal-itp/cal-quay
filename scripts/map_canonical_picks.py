@@ -273,7 +273,7 @@ def main() -> None:
 
     html = _HTML.replace("__DATA__", json.dumps(clusters, separators=(",", ":")))
     html = html.replace("__TITLE__", f"{len(clusters):,} {tag} · {n_review:,} to review · {src.name}")
-    args.output.write_text(html)
+    args.output.write_text(html, encoding="utf-8")
     print(f"  HTML       -> {args.output}")
     write_gis(clusters, zone_geoms, args.output)
 
