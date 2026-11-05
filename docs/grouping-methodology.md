@@ -26,8 +26,11 @@ few thousand locations where multiple agencies each publish their own record for
   `stops.txt` entries, station/entrance records, feeds missing from the rollup).
 - **Geohashes** (levels 7/8/9) computed in SQL via `ST_GEOHASH`, carried as reference columns
   only — grouping is distance-based (step 2) and does not use them.
-- **Direction data:** per-stop `{route_id|direction_id}` sets from `dim_stop_times ⋈ dim_trips`
-  over a 45-day feed-version window, joined on `(base64_url, stop_id)` → the `route_dirs` column.
+- **Direction data:** per-stop `{route_id|direction_id}` sets from `dim_stop_times ⋈ dim_trips`,
+  reading each feed's **latest active version** (`fct_daily_schedule_feeds`, with the versions'
+  exact `_feed_valid_from` days as partition filters), joined on `(base64_url, stop_id)` → the
+  `route_dirs` column. (A recency window here is wrong: it skips stable feeds whose current
+  version is months old, which capped coverage at ~56%.)
 - **Exclusions:** the Bay Area 511 regional aggregator; regional precursor (re-published) feeds;
   **rail-only stops** (modes ⊆ {0 light-rail, 1 subway, 2 rail}); exact cross-feed duplicates.
 - **Result:** **94,313 stops / 195 agencies** with `base64_url`, `location_type`, `parent_station`,
@@ -88,7 +91,7 @@ few thousand locations where multiple agencies each publish their own record for
 | Roadway score penalty | −10 | `cluster_stops.py` |
 | Zone max radius | 25 m | `map_canonical_picks.py` |
 | Projection (distance/OSM) | EPSG:3310 (CA Albers) | both |
-| Direction feed-version window | 45 days | `pull_stops.py` |
+| Direction version selection | latest active feed version | `pull_stops.py` |
 
 ## Validation
 Spot-checked against a set of 12 statewide shared-stop test cases (DDS, Oct 2026): **10/12
@@ -98,7 +101,8 @@ close pair not grouped. A larger regression suite (the plan's 7 canonical cases 
 
 ## Current limitations
 - Canonical picks are **automated, not human-reviewed** (the review bucket marks the uncertain ones).
-- Direction data covers **~56%** of served stops (45-day window).
+- Direction data covers **~97%** of stops (latest active feed versions; the residue is feeds
+  that publish no `direction_id`).
 - **Rail excluded** (`issues/C17`); Sept 2026 snapshot.
 - Dedup can still drop an agency's membership record, and registry IDs are not yet persistent across
   runs (next-tier items from the adversarial review).
