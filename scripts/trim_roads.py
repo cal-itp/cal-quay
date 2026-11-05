@@ -48,10 +48,10 @@ def main() -> None:
 
     parts = []
     for f in SOURCE_FGBS:
-        roads = gpd.read_file(f, columns=[], engine="pyogrio")
+        roads = gpd.read_file(f, columns=["name"], engine="pyogrio")
         hit = np.unique(roads.sindex.query(buffers, predicate="intersects")[1])
         print(f"{f.name}: {len(hit):,} / {len(roads):,} edges near stops")
-        parts.append(roads.iloc[hit][["geometry"]])
+        parts.append(roads.iloc[hit][["name", "geometry"]])
         del roads
 
     out = pd.concat(parts, ignore_index=True).set_crs("EPSG:4326")

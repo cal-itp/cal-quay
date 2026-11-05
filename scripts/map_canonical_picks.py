@@ -310,6 +310,13 @@ _HTML = r"""<!DOCTYPE html>
   <label><input type="checkbox" id="outlines" checked> outlines</label>
   &nbsp;<label><input type="checkbox" id="sat" checked> satellite</label>
   &nbsp;<label><input type="checkbox" id="spokes"> spokes</label>
+  <div style="margin-top:6px"><label>show
+    <select id="cx" style="background:#222;color:#ddd;border:1px solid #444">
+      <option value="all">all groupings</option>
+      <option value="busy">busy &mdash; &ge;3 agencies or &ge;6 stops</option>
+      <option value="complex">complex &mdash; &ge;4 agencies, &ge;10 stops or &ge;60 m span</option>
+      <option value="review">&#9873; review bucket only</option>
+    </select></label></div>
   <div class="leg">
     <span class="dot" style="background:#ffd400;border:1px solid #000;width:14px;height:14px"></span> <b>suggested primary stop</b><br>
     <span class="dot" style="background:#4da3ff"></span> original agency stop<br>
@@ -317,7 +324,7 @@ _HTML = r"""<!DOCTYPE html>
     <span style="display:inline-block;width:12px;height:10px;border:1.5px solid #ffd400;background:rgba(255,212,0,.12);vertical-align:middle;margin-right:5px"></span> grouping outline<br>
     <span style="display:inline-block;width:12px;height:10px;border:1.5px solid #ff8c00;background:rgba(255,140,0,.12);vertical-align:middle;margin-right:5px"></span> <b style="color:#ff8c00">⚑ review later</b> (large/ambiguous or no clear pick — human resolves)
   </div>
-  <div class="leg">Top groupings (most agencies first):</div>
+  <div class="leg">Top groupings (most complex first) &mdash; <span id="count"></span>:</div>
   <div id="list"></div>
 </div>
 <div id="map"></div>
@@ -350,11 +357,21 @@ function popup(m, c){
     ${c.n_agencies} agencies / ${c.n_stops} stops · span ${c.span==null?'?':c.span+' m'} · ${esc(c.method)}
   </div>`;
 }
+const TIERS = {
+  all:     c => true,
+  busy:    c => c.review || c.n_agencies >= 3 || c.n_stops >= 6,
+  complex: c => c.review || c.n_agencies >= 4 || c.n_stops >= 10 || (c.span||0) >= 60,
+  review:  c => c.review,
+};
+function shown(){ return CL.filter(TIERS[document.getElementById('cx').value]); }
+function cxScore(c){
+  return (c.review?1e6:0) + c.n_agencies*1e4 + c.n_stops*100 + (c.span||0);
+}
 function draw(){
   hullLayer.clearLayers(); spokeLayer.clearLayers(); ptLayer.clearLayers();
   const showOutlines = document.getElementById('outlines').checked;
   const showSpokes = document.getElementById('spokes').checked;
-  for(const c of CL){
+  for(const c of shown()){
     const col = c.review ? '#ff8c00' : (c.has_pick ? '#ffd400' : '#bbbbbb');
     if(showOutlines && c.hulls)
       for(const ring of c.hulls)
@@ -375,23 +392,33 @@ function draw(){
         .bindPopup(popup(c.members.find(x=>x.canon)||c.members[0], c)).addTo(ptLayer);
   }
 }
-draw();
+function buildList(){
+  const cs = shown().slice().sort((a,b)=>cxScore(b)-cxScore(a));
+  document.getElementById('count').textContent =
+    cs.length.toLocaleString() + ' of ' + CL.length.toLocaleString() + ' shown';
+  const list = document.getElementById('list');
+  list.innerHTML = '';
+  cs.slice(0,300).forEach(c=>{
+    const d = document.createElement('div'); d.className='row';
+    const names = [...new Set(c.members.map(m=>m.agency))].filter(n=>n&&n!=='(unlabeled feed)').slice(0,4).join(', ');
+    d.innerHTML = `<b>${c.n_agencies} agencies</b><span class="pill">${esc(c.type||'')}</span>
+      <span class="pill">${c.n_stops} stops</span><span class="pill">${c.span==null?'?':c.span+' m'}</span>${c.review?'<span class="pill" style="background:#7a4a00;color:#fd9">⚑ review</span>':''}${c.has_parent?'<span class="pill" style="background:#245">parent/child</span>':''}
+      <div class="m">${esc(names)}</div>`;
+    d.onclick = ()=> map.setView([c.primary.lat,c.primary.lon], 19);
+    list.appendChild(d);
+  });
+}
+for(const [k,fn] of Object.entries(TIERS)){
+  const opt = document.querySelector(`#cx option[value="${k}"]`);
+  opt.textContent += ` (${CL.filter(fn).length.toLocaleString()})`;
+}
+draw(); buildList();
 for(const id of ['outlines','spokes']) document.getElementById(id).onchange = draw;
+document.getElementById('cx').onchange = ()=>{ draw(); buildList(); };
 document.getElementById('sat').onchange = e => {
   if(e.target.checked){ map.removeLayer(osm); sat.addTo(map); }
   else { map.removeLayer(sat); osm.addTo(map); }
 };
-
-const list = document.getElementById('list');
-CL.slice(0,300).forEach(c=>{
-  const d = document.createElement('div'); d.className='row';
-  const names = [...new Set(c.members.map(m=>m.agency))].filter(n=>n&&n!=='(unlabeled feed)').slice(0,4).join(', ');
-  d.innerHTML = `<b>${c.n_agencies} agencies</b><span class="pill">${esc(c.type||'')}</span>
-    <span class="pill">${c.n_stops} stops</span>${c.review?'<span class="pill" style="background:#7a4a00;color:#fd9">⚑ review</span>':''}${c.has_parent?'<span class="pill" style="background:#245">parent/child</span>':''}
-    <div class="m">${esc(names)}</div>`;
-  d.onclick = ()=> map.setView([c.primary.lat,c.primary.lon], 19);
-  list.appendChild(d);
-});
 </script></body></html>"""
 
 
