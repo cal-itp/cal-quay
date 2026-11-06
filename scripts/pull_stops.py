@@ -242,12 +242,38 @@ TABLE_TRIPS = "cal-itp-data-infra.mart_gtfs.dim_trips"
 # per-stop {route_id|direction_id} sets, keyed on (base64_url, stop_id), for
 # direction-aware grouping: two nearby stops serving the same route in opposite
 # directions are an across-the-street inbound/outbound pair -> different stops.
-# Pulled from current feed versions via a recency window on _feed_valid_from —
-# dim_stop_times is only partitioned on that, so the window is what bounds the
-# scan (45 days ~ 25 GB). Dense urban feeds that need splitting refresh often and
-# fall inside it; stale isolated feeds rarely have neighbors to split anyway.
-DIR_WINDOW_DAYS = 45
-SQL_DIRECTIONS = f"""
+#
+# Version selection: the LATEST ACTIVE feed version per URL, from
+# fct_daily_schedule_feeds (120 MB, which feed_key was in effect on each date).
+# A recency window on _feed_valid_from is wrong here — it only matches versions
+# *published* recently, silently dropping every stable feed whose current
+# version is months old (that bug capped route_dirs coverage at ~56%). The
+# active versions' exact _feed_valid_from days are injected as literal
+# partition filters, so the scan stays bounded (one version per feed).
+TABLE_DAILY_FEEDS = "cal-itp-data-infra.mart_gtfs.fct_daily_schedule_feeds"
+# Per-URL latest version AS OF the stop cohort's date — two alignment rules both
+# matter: (a) per-URL (not one global date), so feeds that stopped publishing
+# still contribute their final version; (b) as-of the cohort month, because a
+# stop in last month's rollup may be DROPPED in a newer feed version — "latest
+# ever" loses its directions. Callers must also restrict to the cohort's URLs:
+# unrestricted, the per-URL scan resurrects every historical feed (~3x the cost).
+SQL_ACTIVE_FEEDS = f"""
+SELECT feed_key, base64_url, _feed_valid_from
+FROM (
+  SELECT feed_key, base64_url, _feed_valid_from,
+         ROW_NUMBER() OVER (PARTITION BY base64_url ORDER BY date DESC) AS rn
+  FROM `{TABLE_DAILY_FEEDS}`
+  WHERE date <= @as_of
+)
+WHERE rn = 1
+"""
+
+
+def sql_directions(active: pd.DataFrame) -> str:
+    days = sorted({ts.strftime("%Y-%m-%d") for ts in active["_feed_valid_from"]})
+    day_list = ", ".join(f"TIMESTAMP '{d}'" for d in days)
+    key_list = ", ".join(f"'{k}'" for k in sorted(set(active["feed_key"])))
+    return f"""
 SELECT
   st.base64_url,
   st.stop_id,
@@ -256,8 +282,10 @@ SELECT
 FROM `{TABLE_STOP_TIMES}` st
 JOIN `{TABLE_TRIPS}` tr
   ON st.feed_key = tr.feed_key AND st.trip_id = tr.trip_id
-WHERE st._feed_valid_from >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {DIR_WINDOW_DAYS} DAY)
-  AND tr._feed_valid_from >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {DIR_WINDOW_DAYS} DAY)
+WHERE TIMESTAMP_TRUNC(st._feed_valid_from, DAY) IN ({day_list})
+  AND TIMESTAMP_TRUNC(tr._feed_valid_from, DAY) IN ({day_list})
+  AND st.feed_key IN ({key_list})
+  AND tr.feed_key IN ({key_list})
 GROUP BY 1, 2
 """
 
@@ -268,15 +296,34 @@ def _client():
     return bigquery.Client(project="cal-itp-data-infra")
 
 
+def active_feeds(client, urls=None, as_of=None) -> pd.DataFrame:
+    """Latest feed version per URL as of `as_of` (tiny query, ~120 MB table).
+
+    `urls`: restrict to the stop cohort's base64_urls (keeps the directions
+    scan's partition-day list small). `as_of`: cohort date (default today)."""
+    from google.cloud import bigquery
+
+    jc = bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ScalarQueryParameter("as_of", "DATE", as_of or pd.Timestamp.today().date())])
+    out = client.query(SQL_ACTIVE_FEEDS, job_config=jc).to_dataframe()
+    if urls is not None:
+        out = out[out["base64_url"].isin(set(urls))]
+    return out
+
+
 def dry_run() -> float:
     from google.cloud import bigquery
 
     jc = bigquery.QueryJobConfig(dry_run=True, use_query_cache=False)
     client = _client()
-    return sum(
+    # the feed lookup must actually run to build the directions SQL; its (small)
+    # scan is counted into the estimate rather than hidden
+    lookup = client.query(SQL_ACTIVE_FEEDS, job_config=jc).total_bytes_processed
+    directions = sql_directions(active_feeds(client))
+    return (lookup + sum(
         client.query(q, job_config=jc).total_bytes_processed
-        for q in (SQL_MONTHLY, SQL_LATEST, SQL_DIRECTIONS)
-    ) / 1e9
+        for q in (SQL_MONTHLY, SQL_LATEST, directions)
+    )) / 1e9
 
 
 def _union_route_types(s: pd.Series) -> str:
@@ -320,9 +367,17 @@ def pull_raw(outdir: Path) -> Path:
     monthly["source"] = "rollup"
     latest["source"] = "latest"
     df = pd.concat([monthly, latest], ignore_index=True)
+    # version alignment: the cohort mixes last month's rollup with the current
+    # extract, so take each cohort URL's version as of BOTH dates (deduped) —
+    # month-end recovers stops dropped in newer versions; today covers new stops
+    month_end = (pd.to_datetime(monthly["month_first_day"].iloc[0])
+                 + pd.offsets.MonthEnd(0)).date()
+    urls = set(df["base64_url"].dropna())
+    active = pd.concat([active_feeds(client, urls, as_of=month_end),
+                        active_feeds(client, urls)]).drop_duplicates("feed_key")
     print(f"Querying BigQuery: dim_stop_times JOIN dim_trips "
-          f"(per-stop route/direction, {DIR_WINDOW_DAYS}d window)...")
-    directions = client.query(SQL_DIRECTIONS).to_dataframe()
+          f"(per-stop route/direction, {len(active):,} cohort feed versions)...")
+    directions = client.query(sql_directions(active)).to_dataframe()
     df = df.merge(directions, on=["base64_url", "stop_id"], how="left")
     print(f"  {len(directions):,} (feed, stop) direction records; "
           f"{df['route_dirs'].notna().sum():,}/{len(df):,} raw rows matched")
@@ -411,13 +466,9 @@ def process(raw_path: Path, outdir: Path) -> None:
     # separate track — see issue C17.
     non_boardable = pd.to_numeric(stops["location_type"], errors="coerce").isin([1, 2, 3, 4])
     # a precursor feed duplicates its 511/VCTC re-publication — drop it, unless
-    # it's the operator's only SURVIVING feed in the pull (then it IS the source).
-    # "has another feed" is judged among rows that survive the other exclusions,
-    # else an operator whose other feed is all rail/511/non-boardable would lose
-    # both copies (review finding; no-op on current data, fixed defensively)
+    # it's the operator's only feed in the pull (then it IS the source)
     precursor = stops["regional_feed_type"] == "Regional Precursor Feed"
-    survives_other = ~dup_511 & ~rail & ~non_boardable & ~precursor
-    label_has_other = survives_other.groupby(stops["analysis_name"]).transform("any")
+    label_has_other = (~precursor).groupby(stops["analysis_name"]).transform("any")
     dup_precursor = precursor & label_has_other
     stops = stops[~dup_511 & ~rail & ~dup_precursor & ~non_boardable]
 
