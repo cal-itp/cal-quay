@@ -36,7 +36,7 @@ one high-touch, eight medium-touch, and one self-service.
 | Siskiyou County Transportation Agency | C | S | Medium-touch | Far North | 2 | Highly responsive small rural agency that will have GTFS RT adoption by the end of the year. Tests guided support with a highly engaged small rural county agency. |
 | Trinity County | B | S | High-touch | North State | 2 | Tests hands-on support for a high touch small rural operator that has faced significant technical challenges with maintaining their GTFS and has reached out to us for support. |
 | Sacramento Regional Transit District (SacRT) | A | L | Self-service | Sacramento Valley | 3 | Tests self-service with a large urban operator with several parent and child organization transit stops. |
-| Glenn County Transportation Commission | C | S | Medium-touch | Sacramento Valley / North State | 3 | Has expressed interest in stop ammenity inventory in previous discussions. Adds a small rural agency in the northern Sacramento Valley. |
+| Glenn County Transportation Commission | C | S | Medium-touch | Sacramento Valley / North State | 3 | Has expressed interest in stop amenity inventory in previous discussions. Adds a small rural agency in the northern Sacramento Valley. |
 | Eastern Sierra Transit Authority | C | S | Medium-touch | Eastern Sierra | 9 | Extends coverage to the eastern side of the state and a remote service area. |
 | Long Beach Transit | D | L | Self-service | Los Angeles County | 7 | Suggested outreach target from LA Metro contact; large size supports the self-service test. |
 | City of Torrance (Torrance Transit) | D | M | Medium-touch | Los Angeles County | 7 | Suggested outreach target from LA Metro contact; medium size suggests guided support. |
