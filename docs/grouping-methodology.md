@@ -76,9 +76,18 @@ adjudicator:
   difference < 30° → **VETO** (parallel — same street and direction, a false candidate);
   all differences 60–120° → **CONFIRM** kitty-corner; min > 150° → **across-street**
   (antiparallel); else **mixed**; missing shapes → **no-shapes**.
-- Only CONFIRM/across-street rows become constraints; VETO/mixed/no-shapes rows stay in
-  `data/split_pairs.csv` for the review queue. **Verdicts shape the proposal only** — every
-  multi-agency grouping still passes human review with the verdict and headings as evidence.
+- Only CONFIRM/across-street rows **with full shape coverage** become constraints;
+  VETO/mixed/no-shapes and partial-coverage rows stay in `data/split_pairs.csv` for the review
+  queue. Coverage is full only when every route serving the stop contributed a heading (a
+  missing parallel shape would read as perpendicular) **and** no shape re-enters the stop's
+  neighborhood within a roadway width (an out-and-back or tight-corner revisit can't be
+  attributed to a boarding without stop-sequence data — the closest pass still supplies the
+  verdict text, but the ambiguity blocks the constraint).
+- Pairs adjudicated in an earlier run that are no longer same-group (their constraint worked)
+  are **carried forward and re-adjudicated** on every run — otherwise the next clustering
+  would remerge them and the system would oscillate.
+- **Verdicts shape the proposal only** — every multi-agency grouping still passes human
+  review with the verdict and headings as evidence.
 
 ### 3. Canonical pick (OSM-scored, provisional)
 - Per stop (in EPSG:3310, OSM road geometry read **per spatial tile**): `dist_to_road_meters`,
@@ -119,6 +128,7 @@ adjudicator:
 | Direction version selection | latest active feed version | `pull_stops.py` |
 | Heading chord | ±10 m along the shape (clamped at ends) | `detect_splits.py` |
 | Shape-passes-stop guard | 30 m | `detect_splits.py` |
+| Revisit-ambiguity radius (extra passes) | 15 m (~a roadway width) | `detect_splits.py` |
 | Parallel veto / perpendicular confirm / antiparallel | < 30° / all 60–120° / > 150° | `detect_splits.py` |
 
 ## Validation
@@ -128,13 +138,16 @@ close pair not grouped. A larger regression suite (the plan's 7 canonical cases 
 50–100 statewide cases) is the next validation step.
 
 **Split detection (Nov 2026):** 944 same-group pairs nominated statewide (602 street-geometry,
-520 crossed-names, 178 both) → 682 CONFIRM / 140 VETO / 8 across-street / 43 mixed / 71
-no-shapes. A 54-case satellite-imagery audit ratified **every decided CONFIRM (19/19) and VETO
-(17/17)** verdict; those human-verified pairs ship as real-coordinate regression fixtures
-(`tests/fixtures/human_verified_pairs.csv`) and the suite asserts the pipeline splits/keeps each
-one. Applying the 690 confirmed constraints statewide: 80,663 → 81,201 groups (+538), with
-**99.3 % of groups unchanged**. Across-street verdicts were the hard class on imagery (all
-"unsure") — they constrain (8 pairs) but stay flagged for agency confirmation.
+520 crossed-names, 178 both) → 670 CONFIRM / 140 VETO / 15 across-street / 49 mixed / 70
+no-shapes; coverage gating holds 236 confirm-grade pairs back as partial (missing route shapes
+or revisit ambiguity), leaving **449 constraints**. A 54-case satellite-imagery audit ratified
+**every decided CONFIRM (19/19) and VETO (17/17)** verdict; those human-verified pairs ship as
+real-coordinate regression fixtures (`tests/fixtures/human_verified_pairs.csv`) and the suite
+asserts the pipeline splits/keeps each one. Applying the 449 constraints statewide:
+80,664 → 81,007 groups (+343), all 449 pairs separated; a second detect→cluster cycle is a
+fixed point (carried-forward pairs re-adjudicate identically). Across-street verdicts were the
+hard class on imagery (all "unsure") — the 5 full-coverage ones constrain but stay flagged for
+agency confirmation.
 
 ## Current limitations
 - Canonical picks are **automated, not human-reviewed** (the review bucket marks the uncertain ones).

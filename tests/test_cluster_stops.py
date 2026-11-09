@@ -187,6 +187,18 @@ class GroupingTests(unittest.TestCase):
         })
         self.assertEqual(load_split_pairs("/nonexistent/split_pairs.csv"), set())
 
+    def test_load_split_pairs_requires_full_coverage(self):
+        import tempfile
+        rows = (
+            "cluster_id,a_url,a_stop,b_url,b_stop,coverage,verdict\n"
+            "1,X,1,Y,2,full,CONFIRM kitty (perpendicular)\n"
+            "2,X,3,Y,4,partial,CONFIRM kitty (perpendicular)\n"
+        )
+        with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False) as f:
+            f.write(rows)
+        self.assertEqual(load_split_pairs(f.name),
+                         {frozenset({("X", "1"), ("Y", "2")})})
+
     def test_load_split_pairs_tolerates_empty_outputs(self):
         import tempfile
         header_only = "cluster_id,a_url,a_stop,b_url,b_stop,verdict\n"

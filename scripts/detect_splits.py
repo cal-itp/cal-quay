@@ -54,6 +54,9 @@ CLEAR_MARGIN_M = 5.0    # own street must be this much nearer than the other's
 
 CHORD_M = 10.0          # heading chord half-length along the shape
 MAX_SHAPE_DIST_M = 30.0  # shape must pass this close to the stop to count
+EXTRA_PASS_MAX_M = 15.0  # extra passes beyond the closest must be this close:
+                         # the opposite travel lane of the stop's own street is
+                         # within a roadway width; farther = the cross street
 PARALLEL_MAX_DEG = 30.0
 ANTI_MIN_DEG = 150.0
 
@@ -164,6 +167,10 @@ def crossed_name_pairs(cand: pd.DataFrame, pts: gpd.GeoDataFrame) -> list:
 def load_shapes() -> tuple[dict, dict]:
     """(stop-level, route-level) shape indexes with EPSG:3310 geometries."""
     def to_3310(geojson_strs):
+        # ~45% of shapes arrive as MultiLineString: BigQuery nodes
+        # self-crossing routes into pieces (not path-ordered, so they can't
+        # be re-stitched). shape_passes reads each part separately and the
+        # lookup flags near revisits as ambiguity -> partial coverage.
         geoms = [shp_shape(json.loads(g)) for g in geojson_strs]
         return list(gpd.GeoSeries(geoms, crs="EPSG:4326").to_crs(CA_ALBERS))
 
@@ -192,18 +199,79 @@ def load_shapes() -> tuple[dict, dict]:
     return stop_ix, route_ix
 
 
-def heading_at(line, pt) -> float | None:
-    """Compass travel bearing (deg, 0=N) of `line` where it passes `pt`; None
-    when the shape doesn't pass near the stop. The chord clamps at the shape
-    ends so TERMINAL stops still get a heading (their final travel direction)."""
-    if line.distance(pt) > MAX_SHAPE_DIST_M:
-        return None
-    s = line.project(pt)
-    a = line.interpolate(max(0.0, s - CHORD_M))
-    b = line.interpolate(min(line.length, s + CHORD_M))
-    if a.equals(b):
-        return None
-    return math.degrees(math.atan2(b.x - a.x, b.y - a.y)) % 360.0
+def shape_passes(line, pt) -> list:
+    """-> [(bearing-or-None, closest distance), ...], one entry per PASS of
+    `line` near `pt`, nearest first. An out-and-back or loop shape traverses
+    the stop's neighborhood more than once; the extra visits can't be
+    attributed without stop-sequence data, so the caller treats them as
+    AMBIGUITY, never as extra evidence.
+
+    A pass = one maximal arc-length interval where the line stays within
+    MAX_SHAPE_DIST_M of the stop; a second pass requires the line to LEAVE
+    that neighborhood and return (so a route turning at the stop's corner is
+    still one pass — its chord, like plain projection, reads the approach).
+    Chords clamp at the shape ends so TERMINAL stops keep their final travel
+    direction; a stop exactly at a symmetric turnaround yields a degenerate
+    chord -> bearing None (conservative: no heading -> review, no constraint)."""
+    if hasattr(line, "geoms"):   # multi-part shape: each part separately
+        return sorted((p for part in line.geoms for p in shape_passes(part, pt)),
+                      key=lambda x: x[1])
+    xy = np.asarray(line.coords)
+    if len(xy) < 2:
+        return []
+    p = np.array([pt.x, pt.y])
+    a = xy[:-1]
+    d = xy[1:] - a
+    seg2 = (d ** 2).sum(axis=1)
+    seglen = np.sqrt(seg2)
+    cum = np.concatenate([[0.0], np.cumsum(seglen)])
+    R = MAX_SHAPE_DIST_M
+
+    # arc-length intervals where each segment sits inside the R-neighborhood
+    # (|a + t*d - p| <= R solved per segment), then merged where contiguous
+    intervals = []
+    for k in range(len(seglen)):
+        if seg2[k] == 0:
+            continue
+        ap = p - a[k]
+        bq = float((ap * d[k]).sum())
+        cq = float((ap ** 2).sum()) - R * R
+        disc = bq * bq - seg2[k] * cq
+        if disc < 0:
+            continue
+        sq = math.sqrt(disc)
+        t0 = max(0.0, (bq - sq) / seg2[k])
+        t1 = min(1.0, (bq + sq) / seg2[k])
+        if t0 <= t1:
+            intervals.append((cum[k] + t0 * seglen[k], cum[k] + t1 * seglen[k]))
+    if not intervals:
+        return []
+    intervals.sort()
+    merged = [list(intervals[0])]
+    for s0, s1 in intervals[1:]:
+        if s0 <= merged[-1][1] + 1e-6:
+            merged[-1][1] = max(merged[-1][1], s1)
+        else:
+            merged.append([s0, s1])
+
+    # closest approach + chord bearing per pass, nearest pass first
+    t = np.clip(((p - a) * d).sum(axis=1) / np.where(seg2 == 0, 1.0, seg2), 0.0, 1.0)
+    proj = a + t[:, None] * d
+    dist = np.hypot(*(p - proj).T)
+    s_c = cum[:-1] + t * seglen
+    out = []
+    for s0, s1 in merged:
+        mask = (s_c >= s0 - 1e-6) & (s_c <= s1 + 1e-6) & (dist <= R)
+        if not mask.any():
+            continue
+        dmin = float(dist[mask].min())
+        s = float(s_c[mask][np.argmin(dist[mask])])
+        pa = line.interpolate(max(0.0, s - CHORD_M))
+        pb = line.interpolate(min(line.length, s + CHORD_M))
+        brg = (math.degrees(math.atan2(pb.x - pa.x, pb.y - pa.y)) % 360.0
+               if not pa.equals(pb) else None)
+        out.append((brg, dmin))
+    return sorted(out, key=lambda x: x[1])
 
 
 def fold180(d: float) -> float:
@@ -236,33 +304,82 @@ class HeadingLookup:
         self.stop_ix, self.route_ix = stop_ix, route_ix
         self._cache: dict = {}
 
-    def shapes_for(self, url, sid, route_dirs, route_ids) -> list:
+    def shapes_for(self, url, sid, route_dirs, route_ids) -> tuple:
+        """-> (expected_route_ids | None, [(route_id, geom), ...]).
+
+        expected=None means the per-stop pull supplied the shapes (complete by
+        construction: it enumerated the stop's actual serving trips)."""
         shapes = self.stop_ix.get((url, str(sid)), [])
         if shapes:
-            return shapes
+            return None, [(None, g) for g in shapes]
+        expected = set()
         rds = set()
         if isinstance(route_dirs, str) and route_dirs:
             for tok in route_dirs.split(";"):
                 if "|" in tok:
                     rt, d = tok.rsplit("|", 1)
                     rds.add((rt, int(d)))
+                    expected.add(rt)
         if isinstance(route_ids, str) and route_ids:
-            known = {rt for rt, _ in rds}
             for rt in route_ids.split(";"):
-                if rt and rt not in known:
-                    rds |= {(rt, d) for d in (-1, 0, 1) if (url, rt, d) in self.route_ix}
-        return [self.route_ix[(url, rt, d)] for rt, d in sorted(rds)
-                if (url, rt, d) in self.route_ix]
+                if rt:
+                    expected.add(rt)
+                    if rt not in {r for r, _ in rds}:
+                        rds |= {(rt, d) for d in (-1, 0, 1) if (url, rt, d) in self.route_ix}
+        return expected, [((rt), self.route_ix[(url, rt, d)]) for rt, d in sorted(rds)
+                          if (url, rt, d) in self.route_ix]
 
-    def headings(self, row, pt3310) -> list:
-        """`row`: a canonicalizer record carrying base64_url/stop_id/route_dirs/route_ids."""
+    def headings(self, row, pt3310) -> tuple:
+        """`row`: a canonicalizer record (base64_url/stop_id/route_dirs/route_ids).
+
+        -> (sorted headings, full_coverage). The CLOSEST pass of each shape
+        supplies its heading (same semantics as plain projection). Coverage is
+        FULL only when every route serving the stop contributed a heading AND
+        no shape re-enters the stop's neighborhood within EXTRA_PASS_MAX_M —
+        a verdict computed from a subset can invert (a missing parallel shape
+        reads as perpendicular), and a tight-corner/out-and-back revisit can't
+        be attributed without stop-sequence data, so neither may constrain."""
         key = (row.base64_url, str(row.stop_id))
         if key not in self._cache:
-            hs = [heading_at(line, pt3310) for line in self.shapes_for(
+            expected, shapes = self.shapes_for(
                 row.base64_url, row.stop_id,
-                getattr(row, "route_dirs", None), getattr(row, "route_ids", None))]
-            self._cache[key] = sorted({round(h, 1) for h in hs if h is not None})
+                getattr(row, "route_dirs", None), getattr(row, "route_ids", None))
+            hs: set = set()
+            observed: set = set()
+            ambiguous = False
+            for rt, line in shapes:
+                passes = shape_passes(line, pt3310)
+                if not passes:
+                    continue
+                brg, _ = passes[0]
+                if any(dm <= EXTRA_PASS_MAX_M for _, dm in passes[1:]):
+                    ambiguous = True
+                if brg is not None:
+                    observed.add(rt)
+                    hs.add(round(brg, 1))
+            full = (bool(hs) and not ambiguous
+                    and (expected is None or observed == expected))
+            self._cache[key] = (sorted(hs), full)
         return self._cache[key]
+
+
+def carry_forward(prev, nominated_keys: set, known_stops: set):
+    """Previously adjudicated pairs to RE-adjudicate this run (anti-oscillation).
+
+    Nomination only sees SAME-group pairs, so once a constraint separates its
+    endpoints the pair stops being nominated; dropping it would let the next
+    cluster run remerge the stops, which the run after would split again.
+    Keep any prior pair not re-nominated whose stops both still exist —
+    verdicts are refreshed against current shapes, never copied forward."""
+    cols = {"a_url", "a_stop", "b_url", "b_stop"}
+    if prev is None or prev.empty or not cols <= set(prev.columns):
+        return pd.DataFrame(columns=sorted(cols))
+    keep = []
+    for r in prev.itertuples():
+        pk = frozenset({(r.a_url, str(r.a_stop)), (r.b_url, str(r.b_stop))})
+        if len(pk) == 2 and pk not in nominated_keys and pk <= known_stops:
+            keep.append(r.Index)
+    return prev.loc[keep]
 
 
 # ---------------------------------------------------------------------- main
@@ -297,16 +414,12 @@ def main() -> None:
 
     lookup = HeadingLookup(*load_shapes())
 
-    rows = []
-    for (i, j), sigs in sorted(signals.items()):
-        a, b = cand.iloc[i], cand.iloc[j]
-        ha = lookup.headings(a, pts.geometry.iloc[i])
-        hb = lookup.headings(b, pts.geometry.iloc[j])
-        sep = float(pts.geometry.iloc[i].distance(pts.geometry.iloc[j]))
-        rows.append({
-            "cluster_id": a.cluster_id, "sep_m": round(sep, 1),
-            "bearing_diff": diffs.get((i, j)),
-            "signal": "+".join(sigs),
+    def adjudicate(a, pa, b, pb, signal, bearing_diff):
+        ha, fa = lookup.headings(a, pa)
+        hb, fb = lookup.headings(b, pb)
+        return {
+            "cluster_id": a.cluster_id, "sep_m": round(float(pa.distance(pb)), 1),
+            "bearing_diff": bearing_diff, "signal": signal,
             "a_agency": a.analysis_name, "a_url": a.base64_url,
             "a_stop": a.stop_id, "a_name": a.stop_name,
             "b_agency": b.analysis_name, "b_url": b.base64_url,
@@ -314,23 +427,62 @@ def main() -> None:
             "n_agencies": a.n_agencies,
             "a_headings": ";".join(str(h) for h in ha),
             "b_headings": ";".join(str(h) for h in hb),
+            "coverage": "full" if fa and fb else "partial",
             "verdict": classify(ha, hb),
-        })
+        }
+
+    rows = [adjudicate(cand.iloc[i], pts.geometry.iloc[i],
+                       cand.iloc[j], pts.geometry.iloc[j],
+                       "+".join(sigs), diffs.get((i, j)))
+            for (i, j), sigs in sorted(signals.items())]
+
+    # anti-oscillation: pairs adjudicated before but no longer same-group
+    # (their constraint worked) are re-adjudicated, never dropped
+    prev = None
+    if OUT.exists():
+        try:
+            prev = pd.read_csv(OUT, dtype=str)
+        except pd.errors.EmptyDataError:
+            prev = None
+    nominated_keys = {
+        frozenset({(cand.iloc[i].base64_url, str(cand.iloc[i].stop_id)),
+                   (cand.iloc[j].base64_url, str(cand.iloc[j].stop_id))})
+        for (i, j) in signals}
+    dfix: dict = {}
+    for k, r in enumerate(df.itertuples()):
+        dfix.setdefault((r.base64_url, str(r.stop_id)), k)
+    carried = carry_forward(prev, nominated_keys, set(dfix))
+    if len(carried):
+        pts_all = gpd.GeoSeries(
+            gpd.points_from_xy(df.stop_lon, df.stop_lat),
+            crs="EPSG:4326").to_crs(CA_ALBERS)
+        for r in carried.itertuples():
+            ka = dfix[(r.a_url, str(r.a_stop))]
+            kb = dfix[(r.b_url, str(r.b_stop))]
+            sig = r.signal if "carried" in str(r.signal) else f"{r.signal}+carried"
+            rows.append(adjudicate(df.iloc[ka], pts_all.iloc[ka],
+                                   df.iloc[kb], pts_all.iloc[kb],
+                                   sig, r.bearing_diff))
+        print(f"  carried forward {len(carried):,} previously adjudicated pairs "
+              f"(separated by an earlier run; re-adjudicated, not copied)")
+
     # explicit schema: an empty result still writes headers, so a later
     # cluster_stops.py run loads an empty constraint set instead of crashing
     res = pd.DataFrame(rows, columns=[
         "cluster_id", "sep_m", "bearing_diff", "signal",
         "a_agency", "a_url", "a_stop", "a_name",
         "b_agency", "b_url", "b_stop", "b_name",
-        "n_agencies", "a_headings", "b_headings", "verdict"])
+        "n_agencies", "a_headings", "b_headings", "coverage", "verdict"])
     res.to_csv(OUT, index=False)
 
     print(f"\n{len(res):,} adjudicated pairs -> {OUT}")
     if len(res):
         print(res["verdict"].value_counts().to_string())
-        nc = res["verdict"].str.startswith(SPLIT_CONSTRAINT_PREFIXES).sum()
-        print(f"{nc:,} pairs become cannot-link constraints "
-              f"(re-run cluster_stops.py to apply)")
+        is_con = res["verdict"].str.startswith(SPLIT_CONSTRAINT_PREFIXES)
+        full = res["coverage"] == "full"
+        print(f"{int((is_con & full).sum()):,} pairs become cannot-link constraints; "
+              f"{int((is_con & ~full).sum()):,} confirm-grade pairs held back as "
+              f"partial-coverage (re-run cluster_stops.py to apply)")
 
 
 if __name__ == "__main__":

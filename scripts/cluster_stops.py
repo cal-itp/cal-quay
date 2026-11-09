@@ -158,6 +158,10 @@ def load_split_pairs(path) -> set:
     if sp.empty or "verdict" not in sp.columns:
         return set()
     sp = sp[sp["verdict"].str.startswith(SPLIT_CONSTRAINT_PREFIXES, na=False)]
+    if "coverage" in sp.columns:
+        # partial shape coverage can invert a verdict (a missing parallel
+        # heading reads as perpendicular) — review-only, never a constraint
+        sp = sp[sp["coverage"] == "full"]
     pairs = {frozenset({(r.a_url, r.a_stop), (r.b_url, r.b_stop)})
              for r in sp.itertuples()}
     pairs = {p for p in pairs if len(p) == 2}

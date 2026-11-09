@@ -58,22 +58,113 @@ def test_classify_thresholds_are_exclusive():
     assert ds.classify([0.0], [ds.PERP_HI]) == ds.VERDICT_CONFIRM
 
 
-# ------------------------------------------------------------- heading_at
-def test_heading_at_cardinal_directions():
+# ------------------------------------------------------------ shape_passes
+def _one(passes):
+    assert len(passes) == 1, passes
+    assert passes[0][0] is not None
+    return passes[0][0]
+
+
+def test_shape_passes_cardinal_directions():
     north = LineString([(0, 0), (0, 100)])   # EPSG:3310-style meters
-    assert math.isclose(ds.heading_at(north, Point(5, 50)), 0.0, abs_tol=1e-9)
+    assert math.isclose(_one(ds.shape_passes(north, Point(5, 50))), 0.0, abs_tol=1e-9)
     south = LineString([(0, 100), (0, 0)])
-    assert math.isclose(ds.heading_at(south, Point(5, 50)), 180.0, abs_tol=1e-9)
+    assert math.isclose(_one(ds.shape_passes(south, Point(5, 50))), 180.0, abs_tol=1e-9)
     east = LineString([(0, 0), (100, 0)])
-    assert math.isclose(ds.heading_at(east, Point(50, 5)), 90.0, abs_tol=1e-9)
+    assert math.isclose(_one(ds.shape_passes(east, Point(50, 5))), 90.0, abs_tol=1e-9)
 
 
-def test_heading_at_guards():
+def test_shape_passes_guards():
     line = LineString([(0, 0), (0, 100)])
-    assert ds.heading_at(line, Point(500, 50)) is None         # shape misses the stop
+    assert ds.shape_passes(line, Point(500, 50)) == []         # shape misses the stop
     # terminal stop: chord clamps at the shape end, heading survives
-    assert math.isclose(ds.heading_at(line, Point(0, 99)), 0.0, abs_tol=1e-9)
-    assert math.isclose(ds.heading_at(line, Point(0, 1)), 0.0, abs_tol=1e-9)
+    assert math.isclose(_one(ds.shape_passes(line, Point(0, 99))), 0.0, abs_tol=1e-9)
+    assert math.isclose(_one(ds.shape_passes(line, Point(0, 1))), 0.0, abs_tol=1e-9)
+
+
+def test_shape_passes_out_and_back_detected():
+    # an out-and-back traverses the stop twice; plain project() sees only the
+    # first visit. Both passes are reported (nearest first) so the lookup can
+    # flag the attribution as AMBIGUOUS — such a stop never drives a constraint
+    line = LineString([(-100, 0), (100, 0), (-100, 0)])
+    passes = ds.shape_passes(line, Point(0, 5))
+    assert len(passes) == 2
+    hs = sorted(p[0] for p in passes)
+    assert math.isclose(hs[0], 90.0, abs_tol=1e-9)
+    assert math.isclose(hs[1], 270.0, abs_tol=1e-9)
+    # symmetric turnaround: one merged pass, degenerate chord -> bearing None
+    tp = ds.shape_passes(line, Point(100, 0))
+    assert len(tp) == 1 and tp[0][0] is None
+
+
+def test_shape_passes_corner_turn_is_one_pass():
+    # a route turning at the stop's corner stays inside the neighborhood the
+    # whole way through — ONE pass reading the approach direction, not a
+    # phantom second visit on the cross street
+    turn = LineString([(0, -100), (0, 0), (100, 0)])
+    passes = ds.shape_passes(turn, Point(3, -15))
+    assert len(passes) == 1
+    assert math.isclose(passes[0][0], 0.0, abs_tol=1e-9)   # northbound approach
+
+
+def test_lookup_far_return_leg_keeps_full_coverage():
+    from types import SimpleNamespace
+    # the shape leaves the stop's street and returns on ANOTHER street 20 m
+    # away — that is the normal corner situation (the cross street's leg),
+    # NOT out-and-back ambiguity; the stop keeps its own street's heading
+    detour = LineString([(0, -100), (0, 100), (50, 100), (50, 20), (-100, 20)])
+    lk = ds.HeadingLookup({}, {("u", "r1", 0): detour})
+    hs, full = lk.headings(SimpleNamespace(
+        base64_url="u", stop_id="s1", route_dirs="r1|0", route_ids=""), Point(3, 0))
+    assert hs == [0.0] and full
+
+
+def test_lookup_near_second_pass_is_ambiguous():
+    from types import SimpleNamespace
+    # out-and-back on the stop's own street: both passes within a roadway
+    # width -> verdict still reads the closest pass, but coverage is partial
+    # so the verdict can never become a constraint
+    line = LineString([(-100, 0), (100, 0), (-100, 0)])
+    lk = ds.HeadingLookup({}, {("u", "r1", 0): line})
+    hs, full = lk.headings(SimpleNamespace(
+        base64_url="u", stop_id="s1", route_dirs="r1|0", route_ids=""), Point(0, 5))
+    assert hs == [90.0]
+    assert not full
+
+
+def test_heading_lookup_coverage():
+    from types import SimpleNamespace
+    north = LineString([(0, 0), (0, 100)])
+    pt = Point(2, 50)
+    # r2 serves the stop but has no shape -> headings exist, coverage partial
+    lk = ds.HeadingLookup({}, {("u", "r1", 0): north})
+    hs, full = lk.headings(SimpleNamespace(
+        base64_url="u", stop_id="s1", route_dirs="r1|0;r2|0", route_ids=""), pt)
+    assert hs == [0.0] and not full
+    # both routes shaped -> full
+    lk2 = ds.HeadingLookup({}, {("u", "r1", 0): north, ("u", "r2", 0): north})
+    _, full2 = lk2.headings(SimpleNamespace(
+        base64_url="u", stop_id="s1", route_dirs="r1|0;r2|0", route_ids=""), pt)
+    assert full2
+    # per-stop shapes are complete by construction
+    lk3 = ds.HeadingLookup({("u", "s1"): [north]}, {})
+    hs3, full3 = lk3.headings(SimpleNamespace(
+        base64_url="u", stop_id="s1", route_dirs="", route_ids=""), pt)
+    assert hs3 == [0.0] and full3
+
+
+def test_carry_forward_keeps_separated_pairs_only():
+    prev = pd.DataFrame([
+        {"a_url": "u1", "a_stop": "1", "b_url": "u2", "b_stop": "2"},   # separated
+        {"a_url": "u1", "a_stop": "3", "b_url": "u2", "b_stop": "4"},   # re-nominated
+        {"a_url": "u1", "a_stop": "9", "b_url": "gone", "b_stop": "9"},  # stop vanished
+    ])
+    nominated = {frozenset({("u1", "3"), ("u2", "4")})}
+    known = {("u1", "1"), ("u2", "2"), ("u1", "3"), ("u2", "4"), ("u1", "9")}
+    out = ds.carry_forward(prev, nominated, known)
+    assert len(out) == 1 and out.iloc[0]["a_stop"] == "1"
+    assert ds.carry_forward(None, set(), set()).empty
+    assert ds.carry_forward(pd.DataFrame(), set(), set()).empty
 
 
 # ------------------------------------------------------------- crossed names
