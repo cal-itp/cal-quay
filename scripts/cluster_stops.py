@@ -7,6 +7,8 @@ Group statewide stops: distance cluster -> constrained direction/road split
      directions (>5 m apart), or stops separated by a drive-network road, must
      be in different groups. Merge nearby groups only if ALL member pairs are
      compatible. Exact-coordinate duplicates always stay together.
+     Heading-verdict pairs from scripts/detect_splits.py (data/split_pairs.csv,
+     CONFIRM/across-street only) join in as additional cannot-links when present.
   3. OSM scoring: dist-to-road + in_roadway per stop (EPSG:3310, statewide). The
      canonical pick demotes in-roadway stops, then prefers the most-served.
 
@@ -134,6 +136,43 @@ def pairwise_constraints(route_dirs, feeds, lats, lons, pts_xy, road_lines):
     return cannot_link, distances
 
 
+# detect_splits.py verdicts that act as cannot-link constraints (the rest —
+# VETO / mixed / no-shapes — are review-queue rows, never constraints).
+SPLIT_CONSTRAINT_PREFIXES = ("CONFIRM", "across")
+
+
+def load_split_pairs(path) -> set:
+    """Heading-adjudicated cannot-link pairs from scripts/detect_splits.py.
+
+    Returns {frozenset({(analysis_name, stop_id), (analysis_name, stop_id)})}
+    for CONFIRM/across-street verdicts; empty set when the file is absent."""
+    path = Path(path)
+    if not path.exists():
+        return set()
+    sp = pd.read_csv(path, dtype=str)
+    sp = sp[sp["verdict"].str.startswith(SPLIT_CONSTRAINT_PREFIXES, na=False)]
+    pairs = {frozenset({(r.a_agency, r.a_stop), (r.b_agency, r.b_stop)})
+             for r in sp.itertuples()}
+    pairs = {p for p in pairs if len(p) == 2}
+    print(f"  split constraints: {len(pairs):,} heading-verdict pairs from {path.name}")
+    return pairs
+
+
+def inject_split_pairs(cannot_link, distances, keys, split_pairs) -> None:
+    """OR the externally adjudicated pairs into the cannot-link matrix.
+
+    `keys` are (analysis_name, stop_id) per row. The minimum-separation guard
+    still applies, so a stale pair can never split coincident records."""
+    if not split_pairs:
+        return
+    n = len(keys)
+    for i in range(n):
+        for j in range(i + 1, n):
+            if (distances[i, j] > MIN_SEP_M
+                    and frozenset({keys[i], keys[j]}) in split_pairs):
+                cannot_link[i, j] = cannot_link[j, i] = True
+
+
 def partition_compatible(cannot_link, distances, positions) -> list:
     """Nearest-first merging, checking every cross-member constraint.
 
@@ -218,9 +257,11 @@ def _read_roads(bbox) -> gpd.GeoDataFrame:
     return pd.concat(parts, ignore_index=True).set_crs("EPSG:4326")
 
 
-def osm_features_and_road_split(df: pd.DataFrame) -> tuple[pd.DataFrame, list]:
+def osm_features_and_road_split(df: pd.DataFrame,
+                                split_pairs=frozenset()) -> tuple[pd.DataFrame, list]:
     """Add OSM features and jointly split direction/road conflicts per tile.
 
+    `split_pairs`: optional heading-verdict cannot-links (load_split_pairs).
     Retain forbidden row pairs for validation after merge_coincident.
     """
     df["dist_to_road_meters"] = np.nan
@@ -264,6 +305,11 @@ def osm_features_and_road_split(df: pd.DataFrame) -> tuple[pd.DataFrame, list]:
             cannot_link, distances = pairwise_constraints(
                 cg["route_dirs"].tolist(), cg["base64_url"].tolist(),
                 cg["stop_lat"].to_numpy(), cg["stop_lon"].to_numpy(), xy, lines)
+            if split_pairs:
+                inject_split_pairs(
+                    cannot_link, distances,
+                    list(zip(cg["analysis_name"], cg["stop_id"].astype(str))),
+                    split_pairs)
             colors = partition_compatible(cannot_link, distances, positions)
             df.loc[cg.index, "_road"] = colors
             i, j = np.where(np.triu(cannot_link, k=1))
@@ -332,7 +378,11 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--input", type=Path)
     ap.add_argument("--output", type=Path, default=DATA_DIR / "canonicalizer_stops_statewide.csv")
+    ap.add_argument("--split-pairs", type=Path, default=DATA_DIR / "split_pairs.csv",
+                    help="detect_splits.py output; CONFIRM/across-street verdicts "
+                         "become cannot-link constraints (skipped if absent)")
     args = ap.parse_args()
+    split_pairs = load_split_pairs(args.split_pairs)
 
     ensure_roads()
     src = args.input or latest_stops()
@@ -350,7 +400,7 @@ def main() -> None:
     df["cluster_id"] = df["_db"].astype(str)
 
     before = df["cluster_id"].nunique()
-    df, forbidden_pairs = osm_features_and_road_split(df)
+    df, forbidden_pairs = osm_features_and_road_split(df, split_pairs)
     rsplit = df["cluster_id"].nunique() - before
     print(f"  combined direction/road split added {rsplit:,} groups "
           f"-> {df['cluster_id'].nunique():,} final groups")
