@@ -149,9 +149,9 @@ class GroupingTests(unittest.TestCase):
         cannot, distances = pairwise_constraints(
             ["", ""], ["feed-a", "feed-b"], lats, lons, [(0, 0), (20, 0)], ())
         self.assertFalse(cannot.any())
-        keys = [("AgencyA", "100"), ("AgencyB", "200")]
+        keys = [("feed-a", "100"), ("feed-b", "200")]
         inject_split_pairs(cannot, distances, keys,
-                           {frozenset({("AgencyA", "100"), ("AgencyB", "200")})})
+                           {frozenset({("feed-a", "100"), ("feed-b", "200")})})
         self.assertTrue(cannot[0, 1])
         labels = partition_compatible(cannot, distances, list(zip(lats, lons)))
         self.assertNotEqual(*labels)
@@ -162,15 +162,15 @@ class GroupingTests(unittest.TestCase):
         lats, lons = np.zeros(n), np.degrees(np.asarray([0, 3]) / EARTH_R)
         cannot, distances = pairwise_constraints(
             ["", ""], ["feed-a", "feed-b"], lats, lons, [(0, 0), (3, 0)], ())
-        keys = [("AgencyA", "100"), ("AgencyB", "200")]
+        keys = [("feed-a", "100"), ("feed-b", "200")]
         inject_split_pairs(cannot, distances, keys,
-                           {frozenset({("AgencyA", "100"), ("AgencyB", "200")})})
+                           {frozenset({("feed-a", "100"), ("feed-b", "200")})})
         self.assertFalse(cannot.any())
 
     def test_load_split_pairs_keeps_only_constraint_verdicts(self):
         import tempfile
         rows = (
-            "cluster_id,a_agency,a_stop,b_agency,b_stop,verdict\n"
+            "cluster_id,a_url,a_stop,b_url,b_stop,verdict\n"
             "1,X,1,Y,2,CONFIRM kitty (perpendicular)\n"
             "2,X,3,Y,4,across-street (antiparallel)\n"
             "3,X,5,Y,6,VETO (parallel: same street+direction)\n"
@@ -187,6 +187,37 @@ class GroupingTests(unittest.TestCase):
         })
         self.assertEqual(load_split_pairs("/nonexistent/split_pairs.csv"), set())
 
+    def test_load_split_pairs_tolerates_empty_outputs(self):
+        import tempfile
+        header_only = "cluster_id,a_url,a_stop,b_url,b_stop,verdict\n"
+        for content in (header_only, "", "\n"):
+            with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False) as f:
+                f.write(content)
+            self.assertEqual(load_split_pairs(f.name), set())
+
+    def test_split_pair_keyed_by_feed_does_not_split_colliding_ids(self):
+        # The same (agency, stop_id) labels exist in two feeds at two different
+        # places (the City of Roseville case). A constraint keyed to one feed's
+        # urls must split only that cluster, never the look-alike.
+        base = math.degrees(20 / EARTH_R)
+        df = pd.DataFrame({
+            "stop_id": ["100", "200", "100", "200"],
+            "cluster_id": ["0", "0", "1", "1"],
+            "analysis_name": ["CityX", "CityY", "CityX", "CityY"],
+            "stop_lat": [34.0, 34.0 + base, 35.0, 35.0 + base],
+            "stop_lon": [-118.0, -118.0, -117.0, -117.0],
+            "route_dirs": ["", "", "", ""],
+            "base64_url": ["feed-a", "feed-b", "feed-c", "feed-d"],
+        })
+        roads = gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+        pairs = {frozenset({("feed-a", "100"), ("feed-b", "200")})}
+        with patch("scripts.cluster_stops._read_roads", return_value=roads):
+            result, forbidden = osm_features_and_road_split(df, split_pairs=pairs)
+        ids = result.set_index(["base64_url", "stop_id"])["cluster_id"]
+        self.assertNotEqual(ids[("feed-a", "100")], ids[("feed-b", "200")])
+        self.assertEqual(ids[("feed-c", "100")], ids[("feed-d", "200")])
+        self.assertEqual(len(forbidden), 1)
+
     def test_split_pairs_through_full_tile_pipeline(self):
         df = pd.DataFrame({
             "stop_id": ["a", "b"], "cluster_id": ["0", "0"],
@@ -196,7 +227,7 @@ class GroupingTests(unittest.TestCase):
             "base64_url": ["feed-a", "feed-b"],
         })
         roads = gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
-        pairs = {frozenset({("AgencyA", "a"), ("AgencyB", "b")})}
+        pairs = {frozenset({("feed-a", "a"), ("feed-b", "b")})}
         with patch("scripts.cluster_stops._read_roads", return_value=roads):
             result, forbidden = osm_features_and_road_split(df, split_pairs=pairs)
         self.assertEqual(result["cluster_id"].nunique(), 2)

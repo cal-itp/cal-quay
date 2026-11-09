@@ -144,14 +144,21 @@ SPLIT_CONSTRAINT_PREFIXES = ("CONFIRM", "across")
 def load_split_pairs(path) -> set:
     """Heading-adjudicated cannot-link pairs from scripts/detect_splits.py.
 
-    Returns {frozenset({(analysis_name, stop_id), (analysis_name, stop_id)})}
-    for CONFIRM/across-street verdicts; empty set when the file is absent."""
+    Returns {frozenset({(base64_url, stop_id), (base64_url, stop_id)})} for
+    CONFIRM/across-street verdicts; empty set when the file is absent. Keyed by
+    FEED url, not agency label — the same (agency, stop_id) can name two
+    different physical stops in two feeds (e.g. City of Roseville)."""
     path = Path(path)
     if not path.exists():
         return set()
-    sp = pd.read_csv(path, dtype=str)
+    try:
+        sp = pd.read_csv(path, dtype=str)
+    except pd.errors.EmptyDataError:
+        return set()
+    if sp.empty or "verdict" not in sp.columns:
+        return set()
     sp = sp[sp["verdict"].str.startswith(SPLIT_CONSTRAINT_PREFIXES, na=False)]
-    pairs = {frozenset({(r.a_agency, r.a_stop), (r.b_agency, r.b_stop)})
+    pairs = {frozenset({(r.a_url, r.a_stop), (r.b_url, r.b_stop)})
              for r in sp.itertuples()}
     pairs = {p for p in pairs if len(p) == 2}
     print(f"  split constraints: {len(pairs):,} heading-verdict pairs from {path.name}")
@@ -161,7 +168,7 @@ def load_split_pairs(path) -> set:
 def inject_split_pairs(cannot_link, distances, keys, split_pairs) -> None:
     """OR the externally adjudicated pairs into the cannot-link matrix.
 
-    `keys` are (analysis_name, stop_id) per row. The minimum-separation guard
+    `keys` are (base64_url, stop_id) per row. The minimum-separation guard
     still applies, so a stale pair can never split coincident records."""
     if not split_pairs:
         return
@@ -308,7 +315,7 @@ def osm_features_and_road_split(df: pd.DataFrame,
             if split_pairs:
                 inject_split_pairs(
                     cannot_link, distances,
-                    list(zip(cg["analysis_name"], cg["stop_id"].astype(str))),
+                    list(zip(cg["base64_url"], cg["stop_id"].astype(str))),
                     split_pairs)
             colors = partition_compatible(cannot_link, distances, positions)
             df.loc[cg.index, "_road"] = colors
@@ -426,7 +433,7 @@ def main() -> None:
     df["canonicalization_method"] = np.where(df["cluster_size"] == 1, "TRIVIAL", "OSM_HEURISTIC")
     df["confidence"] = np.nan
 
-    cols = ["analysis_name", "feed_name", "stop_id", "stop_code", "stop_name",
+    cols = ["analysis_name", "feed_name", "base64_url", "stop_id", "stop_code", "stop_name",
             "stop_lat", "stop_lon", "route_dirs", "route_ids", "served_in_month",
             "cluster_id", "cluster_size", "cluster_span_meters", "cluster_type",
             "n_agencies", "dist_to_road_meters", "in_roadway", "score", "confidence",

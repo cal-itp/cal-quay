@@ -228,41 +228,39 @@ def classify(ha: list, hb: list) -> str:
 
 class HeadingLookup:
     """Travel headings at a stop from the shapes of its serving routes:
-    per-stop shapes when pulled, else route-level shapes via route_dirs/route_ids."""
+    per-stop shapes when pulled, else route-level shapes via the stop's own
+    route_dirs / route_ids. Keyed by FEED url, never by agency label — the
+    same (agency, stop_id) can name two different physical stops in two feeds."""
 
-    def __init__(self, stops: pd.DataFrame, stop_ix: dict, route_ix: dict):
-        self.s = stops.set_index(["analysis_name", "stop_id"]).sort_index()
+    def __init__(self, stop_ix: dict, route_ix: dict):
         self.stop_ix, self.route_ix = stop_ix, route_ix
         self._cache: dict = {}
 
-    def shapes_for(self, agency, sid) -> list:
-        try:
-            rows = self.s.loc[[(agency, str(sid))]]
-        except KeyError:
-            return []
-        row = rows.iloc[0]
-        url = row["base64_url"]
+    def shapes_for(self, url, sid, route_dirs, route_ids) -> list:
         shapes = self.stop_ix.get((url, str(sid)), [])
         if shapes:
             return shapes
         rds = set()
-        if isinstance(row.get("route_dirs"), str) and row["route_dirs"]:
-            for tok in row["route_dirs"].split(";"):
+        if isinstance(route_dirs, str) and route_dirs:
+            for tok in route_dirs.split(";"):
                 if "|" in tok:
                     rt, d = tok.rsplit("|", 1)
                     rds.add((rt, int(d)))
-        if isinstance(row.get("route_ids"), str) and row["route_ids"]:
+        if isinstance(route_ids, str) and route_ids:
             known = {rt for rt, _ in rds}
-            for rt in row["route_ids"].split(";"):
+            for rt in route_ids.split(";"):
                 if rt and rt not in known:
                     rds |= {(rt, d) for d in (-1, 0, 1) if (url, rt, d) in self.route_ix}
         return [self.route_ix[(url, rt, d)] for rt, d in sorted(rds)
                 if (url, rt, d) in self.route_ix]
 
-    def headings(self, agency, sid, pt3310) -> list:
-        key = (agency, str(sid))
+    def headings(self, row, pt3310) -> list:
+        """`row`: a canonicalizer record carrying base64_url/stop_id/route_dirs/route_ids."""
+        key = (row.base64_url, str(row.stop_id))
         if key not in self._cache:
-            hs = [heading_at(line, pt3310) for line in self.shapes_for(agency, sid)]
+            hs = [heading_at(line, pt3310) for line in self.shapes_for(
+                row.base64_url, row.stop_id,
+                getattr(row, "route_dirs", None), getattr(row, "route_ids", None))]
             self._cache[key] = sorted({round(h, 1) for h in hs if h is not None})
         return self._cache[key]
 
@@ -270,8 +268,10 @@ class HeadingLookup:
 # ---------------------------------------------------------------------- main
 def main() -> None:
     canon = latest("canonicalizer_stops_*.csv")
-    df = pd.read_csv(canon, low_memory=False)
-    df["stop_id"] = df["stop_id"].astype(str)
+    df = pd.read_csv(canon, low_memory=False, dtype={"stop_id": str, "stop_code": str})
+    if "base64_url" not in df.columns:
+        raise SystemExit(f"{canon.name} has no base64_url column — re-run "
+                         "cluster_stops.py (feed-keyed identity) first.")
     size = df.groupby("cluster_id")["stop_id"].transform("size")
     cand = df[size > 1].copy().reset_index(drop=True)
     pts = gpd.GeoDataFrame(
@@ -295,27 +295,34 @@ def main() -> None:
     print(f"nominated: {len(geo):,} street-geometry + {len(names):,} crossed-names "
           f"-> {len(signals):,} distinct pairs")
 
-    stops = pd.read_csv(latest("stops_[0-9]*.csv"), low_memory=False, dtype=str)
-    lookup = HeadingLookup(stops, *load_shapes())
+    lookup = HeadingLookup(*load_shapes())
 
     rows = []
     for (i, j), sigs in sorted(signals.items()):
         a, b = cand.iloc[i], cand.iloc[j]
-        ha = lookup.headings(a.analysis_name, a.stop_id, pts.geometry.iloc[i])
-        hb = lookup.headings(b.analysis_name, b.stop_id, pts.geometry.iloc[j])
+        ha = lookup.headings(a, pts.geometry.iloc[i])
+        hb = lookup.headings(b, pts.geometry.iloc[j])
         sep = float(pts.geometry.iloc[i].distance(pts.geometry.iloc[j]))
         rows.append({
             "cluster_id": a.cluster_id, "sep_m": round(sep, 1),
             "bearing_diff": diffs.get((i, j)),
             "signal": "+".join(sigs),
-            "a_agency": a.analysis_name, "a_stop": a.stop_id, "a_name": a.stop_name,
-            "b_agency": b.analysis_name, "b_stop": b.stop_id, "b_name": b.stop_name,
+            "a_agency": a.analysis_name, "a_url": a.base64_url,
+            "a_stop": a.stop_id, "a_name": a.stop_name,
+            "b_agency": b.analysis_name, "b_url": b.base64_url,
+            "b_stop": b.stop_id, "b_name": b.stop_name,
             "n_agencies": a.n_agencies,
             "a_headings": ";".join(str(h) for h in ha),
             "b_headings": ";".join(str(h) for h in hb),
             "verdict": classify(ha, hb),
         })
-    res = pd.DataFrame(rows)
+    # explicit schema: an empty result still writes headers, so a later
+    # cluster_stops.py run loads an empty constraint set instead of crashing
+    res = pd.DataFrame(rows, columns=[
+        "cluster_id", "sep_m", "bearing_diff", "signal",
+        "a_agency", "a_url", "a_stop", "a_name",
+        "b_agency", "b_url", "b_stop", "b_name",
+        "n_agencies", "a_headings", "b_headings", "verdict"])
     res.to_csv(OUT, index=False)
 
     print(f"\n{len(res):,} adjudicated pairs -> {OUT}")

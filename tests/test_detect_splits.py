@@ -123,7 +123,7 @@ def test_human_verified_pairs_regression(monkeypatch):
         for (ag, sid), (lat, lon) in stops.items()])
 
     constrained = fx[fx["verdict"].str.startswith(cs.SPLIT_CONSTRAINT_PREFIXES)]
-    pairs = {frozenset({(r.a_agency, r.a_stop), (r.b_agency, r.b_stop)})
+    pairs = {frozenset({(f"feed-{r.a_agency}", r.a_stop), (f"feed-{r.b_agency}", r.b_stop)})
              for r in constrained.itertuples()}
 
     df["_db"] = cs.dbscan_labels(df)
