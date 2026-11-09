@@ -30,7 +30,9 @@ few thousand locations where multiple agencies each publish their own record for
   reading each feed's **latest active version** (`fct_daily_schedule_feeds`, with the versions'
   exact `_feed_valid_from` days as partition filters), joined on `(base64_url, stop_id)` → the
   `route_dirs` column. (A recency window here is wrong: it skips stable feeds whose current
-  version is months old, which capped coverage at ~56%.)
+  version is months old, which capped coverage at ~56%.) This join is the dominant cost of the
+  pull — ~87.5 GB scanned (up from ~25 GB), since it reaches the full-version `dim_stop_times`;
+  restricting to the cohort's feed versions keeps it partition-pruned (unrestricted it is ~3×).
 - **Exclusions:** the Bay Area 511 regional aggregator; regional precursor (re-published) feeds;
   **rail-only stops** (modes ⊆ {0 light-rail, 1 subway, 2 rail}); exact cross-feed duplicates.
 - **Result:** **94,313 stops / 195 agencies** with `base64_url`, `location_type`, `parent_station`,
@@ -103,6 +105,11 @@ close pair not grouped. A larger regression suite (the plan's 7 canonical cases 
 - Canonical picks are **automated, not human-reviewed** (the review bucket marks the uncertain ones).
 - Direction data covers **~97%** of stops (latest active feed versions; the residue is feeds
   that publish no `direction_id`).
+- When a feed's **month-end and today versions differ**, their `route|dir` values are unioned into
+  one set per stop (to recover stops dropped in the newer version). If a route's `route_id` or
+  `direction_id` encoding changed between the two versions, this could in principle manufacture a
+  false direction split. Not observed on current data; the precise fix is to treat today's version
+  as authoritative and fall back to month-end only for stops it no longer contains.
 - **Rail excluded** (`issues/C17`); Sept 2026 snapshot.
 - Dedup can still drop an agency's membership record, and registry IDs are not yet persistent across
   runs (next-tier items from the adversarial review).

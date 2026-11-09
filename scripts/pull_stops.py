@@ -50,7 +50,6 @@ a new BigQuery pull.
 
 Requires `gcloud auth application-default login` (cal-itp-data-infra).
 
-  uv run scripts/pull_stops.py --dry-run   # estimate the scan, pull nothing
   uv run scripts/pull_stops.py             # pull only if no raw file, then process
   uv run scripts/pull_stops.py --refresh   # force a fresh pull
 """
@@ -270,6 +269,10 @@ WHERE rn = 1
 
 
 def sql_directions(active: pd.DataFrame) -> str:
+    # callers must guard this; an empty frame would emit `feed_key IN ()` /
+    # `_feed_valid_from IN ()` — a syntax error, not an empty result
+    if active.empty:
+        raise ValueError("sql_directions: no active feed versions (would emit IN ())")
     days = sorted({ts.strftime("%Y-%m-%d") for ts in active["_feed_valid_from"]})
     day_list = ", ".join(f"TIMESTAMP '{d}'" for d in days)
     key_list = ", ".join(f"'{k}'" for k in sorted(set(active["feed_key"])))
@@ -309,21 +312,6 @@ def active_feeds(client, urls=None, as_of=None) -> pd.DataFrame:
     if urls is not None:
         out = out[out["base64_url"].isin(set(urls))]
     return out
-
-
-def dry_run() -> float:
-    from google.cloud import bigquery
-
-    jc = bigquery.QueryJobConfig(dry_run=True, use_query_cache=False)
-    client = _client()
-    # the feed lookup must actually run to build the directions SQL; its (small)
-    # scan is counted into the estimate rather than hidden
-    lookup = client.query(SQL_ACTIVE_FEEDS, job_config=jc).total_bytes_processed
-    directions = sql_directions(active_feeds(client))
-    return (lookup + sum(
-        client.query(q, job_config=jc).total_bytes_processed
-        for q in (SQL_MONTHLY, SQL_LATEST, directions)
-    )) / 1e9
 
 
 def _union_route_types(s: pd.Series) -> str:
@@ -375,12 +363,20 @@ def pull_raw(outdir: Path) -> Path:
     urls = set(df["base64_url"].dropna())
     active = pd.concat([active_feeds(client, urls, as_of=month_end),
                         active_feeds(client, urls)]).drop_duplicates("feed_key")
-    print(f"Querying BigQuery: dim_stop_times JOIN dim_trips "
-          f"(per-stop route/direction, {len(active):,} cohort feed versions)...")
-    directions = client.query(sql_directions(active)).to_dataframe()
-    df = df.merge(directions, on=["base64_url", "stop_id"], how="left")
-    print(f"  {len(directions):,} (feed, stop) direction records; "
-          f"{df['route_dirs'].notna().sum():,}/{len(df):,} raw rows matched")
+    if active.empty:
+        # no feed versions resolved for the cohort (e.g. a fct_daily_schedule_feeds
+        # gap) — skip the directions join rather than build `feed_key IN ()`. The
+        # pull still yields stops, just without direction-aware splitting.
+        print("  WARNING: no active feed versions for the cohort; route_dirs "
+              "left empty (direction-aware splitting disabled)")
+        df["route_dirs"] = pd.NA
+    else:
+        print(f"Querying BigQuery: dim_stop_times JOIN dim_trips "
+              f"(per-stop route/direction, {len(active):,} cohort feed versions)...")
+        directions = client.query(sql_directions(active)).to_dataframe()
+        df = df.merge(directions, on=["base64_url", "stop_id"], how="left")
+        print(f"  {len(directions):,} (feed, stop) direction records; "
+              f"{df['route_dirs'].notna().sum():,}/{len(df):,} raw rows matched")
     # plain datetime: the BigQuery client's 'dbdate' extension dtype doesn't
     # survive a parquet round-trip without db_dtypes imported at read time
     df["month_first_day"] = pd.to_datetime(df["month_first_day"])
@@ -466,9 +462,13 @@ def process(raw_path: Path, outdir: Path) -> None:
     # separate track — see issue C17.
     non_boardable = pd.to_numeric(stops["location_type"], errors="coerce").isin([1, 2, 3, 4])
     # a precursor feed duplicates its 511/VCTC re-publication — drop it, unless
-    # it's the operator's only feed in the pull (then it IS the source)
+    # it's the operator's only SURVIVING feed in the pull (then it IS the source).
+    # "has another feed" is judged among rows that survive the other exclusions,
+    # else an operator whose other feed is all rail/511/non-boardable would lose
+    # both copies (review finding; no-op on current data, fixed defensively)
     precursor = stops["regional_feed_type"] == "Regional Precursor Feed"
-    label_has_other = (~precursor).groupby(stops["analysis_name"]).transform("any")
+    survives_other = ~dup_511 & ~rail & ~non_boardable & ~precursor
+    label_has_other = survives_other.groupby(stops["analysis_name"]).transform("any")
     dup_precursor = precursor & label_has_other
     stops = stops[~dup_511 & ~rail & ~dup_precursor & ~non_boardable]
 
@@ -523,17 +523,12 @@ def process(raw_path: Path, outdir: Path) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--dry-run", action="store_true", help="estimate scan size and exit")
     ap.add_argument(
         "--refresh", action="store_true",
         help="pull fresh from BigQuery even if a raw parquet exists",
     )
     ap.add_argument("--outdir", type=Path, default=DATA_DIR, help="output directory")
     args = ap.parse_args()
-
-    if args.dry_run:
-        print(f"dry-run scan: {dry_run():.2f} GB")
-        return
 
     args.outdir.mkdir(exist_ok=True)
     # newest by mtime, not filename: the complete-month stamp can move backwards
