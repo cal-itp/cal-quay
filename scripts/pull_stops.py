@@ -50,7 +50,6 @@ a new BigQuery pull.
 
 Requires `gcloud auth application-default login` (cal-itp-data-infra).
 
-  uv run scripts/pull_stops.py --dry-run   # estimate the scan, pull nothing
   uv run scripts/pull_stops.py             # pull only if no raw file, then process
   uv run scripts/pull_stops.py --refresh   # force a fresh pull
 """
@@ -242,12 +241,42 @@ TABLE_TRIPS = "cal-itp-data-infra.mart_gtfs.dim_trips"
 # per-stop {route_id|direction_id} sets, keyed on (base64_url, stop_id), for
 # direction-aware grouping: two nearby stops serving the same route in opposite
 # directions are an across-the-street inbound/outbound pair -> different stops.
-# Pulled from current feed versions via a recency window on _feed_valid_from —
-# dim_stop_times is only partitioned on that, so the window is what bounds the
-# scan (45 days ~ 25 GB). Dense urban feeds that need splitting refresh often and
-# fall inside it; stale isolated feeds rarely have neighbors to split anyway.
-DIR_WINDOW_DAYS = 45
-SQL_DIRECTIONS = f"""
+#
+# Version selection: the LATEST ACTIVE feed version per URL, from
+# fct_daily_schedule_feeds (120 MB, which feed_key was in effect on each date).
+# A recency window on _feed_valid_from is wrong here — it only matches versions
+# *published* recently, silently dropping every stable feed whose current
+# version is months old (that bug capped route_dirs coverage at ~56%). The
+# active versions' exact _feed_valid_from days are injected as literal
+# partition filters, so the scan stays bounded (one version per feed).
+TABLE_DAILY_FEEDS = "cal-itp-data-infra.mart_gtfs.fct_daily_schedule_feeds"
+# Per-URL latest version AS OF the stop cohort's date — two alignment rules both
+# matter: (a) per-URL (not one global date), so feeds that stopped publishing
+# still contribute their final version; (b) as-of the cohort month, because a
+# stop in last month's rollup may be DROPPED in a newer feed version — "latest
+# ever" loses its directions. Callers must also restrict to the cohort's URLs:
+# unrestricted, the per-URL scan resurrects every historical feed (~3x the cost).
+SQL_ACTIVE_FEEDS = f"""
+SELECT feed_key, base64_url, _feed_valid_from
+FROM (
+  SELECT feed_key, base64_url, _feed_valid_from,
+         ROW_NUMBER() OVER (PARTITION BY base64_url ORDER BY date DESC) AS rn
+  FROM `{TABLE_DAILY_FEEDS}`
+  WHERE date <= @as_of
+)
+WHERE rn = 1
+"""
+
+
+def sql_directions(active: pd.DataFrame) -> str:
+    # callers must guard this; an empty frame would emit `feed_key IN ()` /
+    # `_feed_valid_from IN ()` — a syntax error, not an empty result
+    if active.empty:
+        raise ValueError("sql_directions: no active feed versions (would emit IN ())")
+    days = sorted({ts.strftime("%Y-%m-%d") for ts in active["_feed_valid_from"]})
+    day_list = ", ".join(f"TIMESTAMP '{d}'" for d in days)
+    key_list = ", ".join(f"'{k}'" for k in sorted(set(active["feed_key"])))
+    return f"""
 SELECT
   st.base64_url,
   st.stop_id,
@@ -256,8 +285,10 @@ SELECT
 FROM `{TABLE_STOP_TIMES}` st
 JOIN `{TABLE_TRIPS}` tr
   ON st.feed_key = tr.feed_key AND st.trip_id = tr.trip_id
-WHERE st._feed_valid_from >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {DIR_WINDOW_DAYS} DAY)
-  AND tr._feed_valid_from >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {DIR_WINDOW_DAYS} DAY)
+WHERE TIMESTAMP_TRUNC(st._feed_valid_from, DAY) IN ({day_list})
+  AND TIMESTAMP_TRUNC(tr._feed_valid_from, DAY) IN ({day_list})
+  AND st.feed_key IN ({key_list})
+  AND tr.feed_key IN ({key_list})
 GROUP BY 1, 2
 """
 
@@ -268,15 +299,19 @@ def _client():
     return bigquery.Client(project="cal-itp-data-infra")
 
 
-def dry_run() -> float:
+def active_feeds(client, urls=None, as_of=None) -> pd.DataFrame:
+    """Latest feed version per URL as of `as_of` (tiny query, ~120 MB table).
+
+    `urls`: restrict to the stop cohort's base64_urls (keeps the directions
+    scan's partition-day list small). `as_of`: cohort date (default today)."""
     from google.cloud import bigquery
 
-    jc = bigquery.QueryJobConfig(dry_run=True, use_query_cache=False)
-    client = _client()
-    return sum(
-        client.query(q, job_config=jc).total_bytes_processed
-        for q in (SQL_MONTHLY, SQL_LATEST, SQL_DIRECTIONS)
-    ) / 1e9
+    jc = bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ScalarQueryParameter("as_of", "DATE", as_of or pd.Timestamp.today().date())])
+    out = client.query(SQL_ACTIVE_FEEDS, job_config=jc).to_dataframe()
+    if urls is not None:
+        out = out[out["base64_url"].isin(set(urls))]
+    return out
 
 
 def _union_route_types(s: pd.Series) -> str:
@@ -320,12 +355,28 @@ def pull_raw(outdir: Path) -> Path:
     monthly["source"] = "rollup"
     latest["source"] = "latest"
     df = pd.concat([monthly, latest], ignore_index=True)
-    print(f"Querying BigQuery: dim_stop_times JOIN dim_trips "
-          f"(per-stop route/direction, {DIR_WINDOW_DAYS}d window)...")
-    directions = client.query(SQL_DIRECTIONS).to_dataframe()
-    df = df.merge(directions, on=["base64_url", "stop_id"], how="left")
-    print(f"  {len(directions):,} (feed, stop) direction records; "
-          f"{df['route_dirs'].notna().sum():,}/{len(df):,} raw rows matched")
+    # version alignment: the cohort mixes last month's rollup with the current
+    # extract, so take each cohort URL's version as of BOTH dates (deduped) —
+    # month-end recovers stops dropped in newer versions; today covers new stops
+    month_end = (pd.to_datetime(monthly["month_first_day"].iloc[0])
+                 + pd.offsets.MonthEnd(0)).date()
+    urls = set(df["base64_url"].dropna())
+    active = pd.concat([active_feeds(client, urls, as_of=month_end),
+                        active_feeds(client, urls)]).drop_duplicates("feed_key")
+    if active.empty:
+        # no feed versions resolved for the cohort (e.g. a fct_daily_schedule_feeds
+        # gap) — skip the directions join rather than build `feed_key IN ()`. The
+        # pull still yields stops, just without direction-aware splitting.
+        print("  WARNING: no active feed versions for the cohort; route_dirs "
+              "left empty (direction-aware splitting disabled)")
+        df["route_dirs"] = pd.NA
+    else:
+        print(f"Querying BigQuery: dim_stop_times JOIN dim_trips "
+              f"(per-stop route/direction, {len(active):,} cohort feed versions)...")
+        directions = client.query(sql_directions(active)).to_dataframe()
+        df = df.merge(directions, on=["base64_url", "stop_id"], how="left")
+        print(f"  {len(directions):,} (feed, stop) direction records; "
+              f"{df['route_dirs'].notna().sum():,}/{len(df):,} raw rows matched")
     # plain datetime: the BigQuery client's 'dbdate' extension dtype doesn't
     # survive a parquet round-trip without db_dtypes imported at read time
     df["month_first_day"] = pd.to_datetime(df["month_first_day"])
@@ -472,17 +523,12 @@ def process(raw_path: Path, outdir: Path) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--dry-run", action="store_true", help="estimate scan size and exit")
     ap.add_argument(
         "--refresh", action="store_true",
         help="pull fresh from BigQuery even if a raw parquet exists",
     )
     ap.add_argument("--outdir", type=Path, default=DATA_DIR, help="output directory")
     args = ap.parse_args()
-
-    if args.dry_run:
-        print(f"dry-run scan: {dry_run():.2f} GB")
-        return
 
     args.outdir.mkdir(exist_ok=True)
     # newest by mtime, not filename: the complete-month stamp can move backwards
