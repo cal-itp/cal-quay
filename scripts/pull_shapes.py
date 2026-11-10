@@ -2,10 +2,12 @@
 Pull route shapes for every (feed, route) serving a grouping-candidate stop.
 
 Route-level (not per-stop) to stay off dim_stop_times: targets come from the
-route_dirs / route_ids columns of the stops pull, restricted to stops in
-multi-agency groupings. Feed versions are the ACTIVE ones per cohort URL
-(pull_stops.active_feeds — exact _feed_valid_from days as partition filters,
-no recency window). One best shape per (feed, route, direction) by trip count.
+route_dirs / route_ids columns of the stops pull, for stops in any MULTI-STOP
+group (same-agency corners split too — detect_splits nominates them all).
+Feed versions are the ACTIVE ones per cohort URL as of the rollup month-end
+AND today — the same pair pull_stops uses for route_dirs, so a stop whose
+directions came from the month-end version still finds its shapes. One best
+shape per (feed, route, direction) by trip count.
 
   uv run scripts/pull_shapes.py --dry-run     # print scan size only
   uv run scripts/pull_shapes.py               # ~15 GB measured (Sept cohort)
@@ -46,13 +48,25 @@ def latest_canonicalizer() -> Path:
     return hits[-1]
 
 
+def cohort_month_end(stops_path: Path):
+    """stops_2026_09.csv -> 2026-09-30 (the rollup month's last day)."""
+    import re
+    m = re.search(r"stops_(\d{4})_(\d{2})", stops_path.name)
+    if not m:
+        raise SystemExit(f"can't parse rollup month from {stops_path.name}")
+    first = pd.Timestamp(year=int(m.group(1)), month=int(m.group(2)), day=1)
+    return (first + pd.offsets.MonthEnd(1)).date()
+
+
 def targets() -> pd.DataFrame:
-    """(base64_url, route_id) pairs serving any stop in a multi-agency group."""
+    """(base64_url, route_id) pairs serving any stop in a multi-STOP group."""
     canon = pd.read_csv(latest_canonicalizer(), low_memory=False, dtype=str)
     s9 = pd.read_csv(latest_stops(), low_memory=False, dtype=str)
-    canon["n_agencies"] = canon["n_agencies"].astype(float)
-    cand = canon[canon.n_agencies >= 2][["analysis_name", "stop_id"]].drop_duplicates()
-    s = s9.merge(cand, on=["analysis_name", "stop_id"])
+    size = pd.to_numeric(canon["cluster_size"], errors="coerce")
+    key = ["base64_url", "stop_id"] if "base64_url" in canon.columns else \
+          ["analysis_name", "stop_id"]
+    cand = canon[size >= 2][key].drop_duplicates()
+    s = s9.merge(cand, on=key)
     out = set()
     for r in s.itertuples():
         routes = set()
@@ -67,6 +81,9 @@ def targets() -> pd.DataFrame:
 
 
 def build_sql(t: pd.DataFrame, active: pd.DataFrame) -> str:
+    # an empty frame would render IN () / UNNEST([]) — invalid SQL (cf. #15)
+    assert len(t), "no (feed, route) targets — run pull_stops + cluster_stops first"
+    assert len(active), "no active feed versions matched the target URLs"
     rows = ",\n".join(
         f"STRUCT({json.dumps(u)} AS u, {json.dumps(r)} AS r)" for u, r in t.itertuples(index=False))
     days = sorted({ts.strftime("%Y-%m-%d") for ts in active["_feed_valid_from"]})
@@ -113,8 +130,15 @@ def main():
     from google.cloud import bigquery
     client = bigquery.Client(project="cal-itp-data-infra")
     t = targets()
-    active = active_feeds(client, urls=set(t["base64_url"]))
-    print(f"{len(active):,} active feed versions for the target URLs")
+    # month-end AND today, like pull_stops.pull_raw: route_dirs can come from
+    # either version, so shapes must cover both or stops lose coverage
+    month_end = cohort_month_end(latest_stops())
+    urls = set(t["base64_url"])
+    active = pd.concat([
+        active_feeds(client, urls=urls, as_of=month_end),
+        active_feeds(client, urls=urls),
+    ]).drop_duplicates(subset=["feed_key"])
+    print(f"{len(active):,} active feed versions (as of {month_end} and today)")
     sql = build_sql(t, active)
     job = client.query(sql, job_config=bigquery.QueryJobConfig(dry_run=True, use_query_cache=False))
     gb = job.total_bytes_processed / 1e9
