@@ -168,7 +168,14 @@ crosswalk table (§7). Published on a predictable cadence (monthly, then faster)
 
 Contents. Field names follow an existing standard wherever one exists — GTFS `stops.txt`
 or the [transit-amenity-atlas schema](https://github.com/cal-itp/transit-amenity-atlas/blob/main/schema.md)
-— and new names are invented only where no standard covers the concept. **The universal
+— and new names are invented only where no standard covers the concept. *Watch item:* two
+open GTFS proposals cover exactly this space —
+[google/transit#608 "Station and stop amenities"](https://github.com/google/transit/issues/608)
+(seating/shelter/lighting as stop attributes; cites LA Metro among motivating agencies) and
+[#664 "Station and stop facilities"](https://github.com/google/transit/issues/664). If #608
+is adopted, its field names and enums take precedence over the atlas names below for the
+amenity columns, and any agency-facing amenities side file should be specified as a
+conforming implementation of that extension rather than a Caltrans-only format. **The universal
 identifier is proposed as an *additional* field: it never overwrites or replaces an
 agency's `stop_id` or `stop_code`** — the agency's own identifiers stay untouched (which
 is also the law, §14113(c)) and are carried in the crosswalk (§7.1).
