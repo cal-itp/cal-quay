@@ -10,10 +10,18 @@ directions came from the month-end version still finds its shapes. One best
 shape per (feed, route, direction) by trip count.
 
   uv run scripts/pull_shapes.py --dry-run     # print scan size only
-  uv run scripts/pull_shapes.py               # ~15 GB measured (Sept cohort)
+  uv run scripts/pull_shapes.py               # ~14 GB measured (Oct cohort)
+  uv run scripts/pull_shapes.py --per-stop    # ~28 GB: shapes per (feed, stop)
 
 Output: data/route_shapes.csv (route_id, direction_id, shape GeoJSON) —
 consumed by detect_splits.py for travel-heading adjudication.
+
+--per-stop additionally writes data/stop_shapes.csv for every stop appearing
+in split_pairs.csv, joining through dim_stop_times so (a) rollup-vs-trips
+route_id mismatches and shapeless route tokens don't lose coverage, and
+(b) the shape variant that actually SERVES the stop wins (not the route's
+statewide-dominant branch). detect_splits treats these as complete evidence,
+restoring full coverage where route-level matching can't.
 """
 
 import argparse
@@ -27,8 +35,10 @@ from pull_stops import active_feeds
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = REPO_ROOT / "data"
 OUT = DATA_DIR / "route_shapes.csv"
-MAX_SCAN_GB = 40.0   # hard gate; the measured scan is ~15 GB
+OUT_STOP = DATA_DIR / "stop_shapes.csv"
+MAX_SCAN_GB = 40.0   # hard gate; measured: ~14 GB route-level, ~28 GB per-stop
 
+ST = "cal-itp-data-infra.mart_gtfs.dim_stop_times"
 TR = "cal-itp-data-infra.mart_gtfs.dim_trips"
 RT = "cal-itp-data-infra.mart_gtfs.dim_routes"
 SH = "cal-itp-data-infra.mart_gtfs.dim_shapes_arrays"
@@ -123,23 +133,95 @@ GROUP BY 1, 2, 3, 4
 """
 
 
+def stop_targets() -> pd.DataFrame:
+    """(base64_url, stop_id) for every stop in a pair that NEEDS rescue —
+    non-full coverage (missing/shapeless routes, revisits, no shapes). Pairs
+    already adjudicated on full evidence don't pay for a stop_times scan."""
+    p = DATA_DIR / "split_pairs.csv"
+    if not p.exists():
+        raise SystemExit("No data/split_pairs.csv — run detect_splits.py first.")
+    sp = pd.read_csv(p, dtype=str)
+    if "coverage" in sp.columns:
+        sp = sp[sp["coverage"] != "full"]
+    pairs = ({(r.a_url, r.a_stop) for r in sp.itertuples()}
+             | {(r.b_url, r.b_stop) for r in sp.itertuples()})
+    t = pd.DataFrame(sorted(pairs), columns=["base64_url", "stop_id"])
+    print(f"{len(t):,} (feed, stop) targets from {len(sp):,} non-full-coverage pairs")
+    return t
+
+
+def build_stop_sql(t: pd.DataFrame, active: pd.DataFrame) -> str:
+    assert len(t), "no (feed, stop) targets — run detect_splits.py first"
+    assert len(active), "no active feed versions matched the target URLs"
+    rows = ",\n".join(
+        f"STRUCT({json.dumps(u)} AS u, {json.dumps(s)} AS s)" for u, s in t.itertuples(index=False))
+    days = sorted({ts.strftime("%Y-%m-%d") for ts in active["_feed_valid_from"]})
+    day_list = ", ".join(f"TIMESTAMP '{d}'" for d in days)
+    key_list = ", ".join(f"'{k}'" for k in sorted(set(active["feed_key"])))
+    return f"""
+WITH tgt AS (SELECT * FROM UNNEST([{rows}])),
+stop_shapes AS (
+  SELECT st.base64_url, st.stop_id, tr.feed_key, tr.route_id,
+         IFNULL(tr.direction_id, -1) AS direction_id, tr.shape_id,
+         COUNT(*) AS n_trips
+  FROM `{ST}` st
+  JOIN `{TR}` tr ON st.feed_key = tr.feed_key AND st.trip_id = tr.trip_id
+  JOIN tgt ON tgt.u = st.base64_url AND tgt.s = st.stop_id
+  WHERE TIMESTAMP_TRUNC(st._feed_valid_from, DAY) IN ({day_list})
+    AND st.feed_key IN ({key_list})
+    AND TIMESTAMP_TRUNC(tr._feed_valid_from, DAY) IN ({day_list})
+    AND tr.feed_key IN ({key_list})
+    AND tr.shape_id IS NOT NULL
+  GROUP BY 1, 2, 3, 4, 5, 6
+),
+best AS (
+  SELECT * FROM stop_shapes
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY base64_url, stop_id, route_id, direction_id
+    ORDER BY n_trips DESC, shape_id) = 1
+)
+SELECT
+  b.base64_url, b.stop_id, b.route_id, b.direction_id, b.n_trips,
+  ANY_VALUE(rt.route_short_name) AS route_short_name,
+  ANY_VALUE(ST_ASGEOJSON(ST_SIMPLIFY(
+    ST_MAKELINE(ARRAY(SELECT pt FROM UNNEST(sh.pt_array) AS pt)), 3))) AS shape_geojson
+FROM best b
+JOIN `{SH}` sh ON sh.feed_key = b.feed_key AND sh.shape_id = b.shape_id
+LEFT JOIN `{RT}` rt ON rt.feed_key = b.feed_key AND rt.route_id = b.route_id
+  AND TIMESTAMP_TRUNC(rt._feed_valid_from, DAY) IN ({day_list})
+WHERE TIMESTAMP_TRUNC(sh._feed_valid_from, DAY) IN ({day_list})
+  AND sh.feed_key IN ({key_list})
+GROUP BY 1, 2, 3, 4, 5
+"""
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--per-stop", action="store_true",
+                    help="shapes per (feed, stop) via dim_stop_times -> stop_shapes.csv")
     args = ap.parse_args()
     from google.cloud import bigquery
     client = bigquery.Client(project="cal-itp-data-infra")
-    t = targets()
+    t = stop_targets() if args.per_stop else targets()
     # month-end AND today, like pull_stops.pull_raw: route_dirs can come from
     # either version, so shapes must cover both or stops lose coverage
     month_end = cohort_month_end(latest_stops())
     urls = set(t["base64_url"])
-    active = pd.concat([
-        active_feeds(client, urls=urls, as_of=month_end),
-        active_feeds(client, urls=urls),
-    ]).drop_duplicates(subset=["feed_key"])
-    print(f"{len(active):,} active feed versions (as of {month_end} and today)")
-    sql = build_sql(t, active)
+    if args.per_stop:
+        # today-only: dim_stop_times is the expensive table and the month-end
+        # day set would double the scan (54 GB measured vs ~28). Stops that
+        # exist ONLY in the month-end version (~100 statewide) stay on
+        # route-level shapes / review instead.
+        active = active_feeds(client, urls=urls)
+        print(f"{len(active):,} active feed versions (today)")
+    else:
+        active = pd.concat([
+            active_feeds(client, urls=urls, as_of=month_end),
+            active_feeds(client, urls=urls),
+        ]).drop_duplicates(subset=["feed_key"])
+        print(f"{len(active):,} active feed versions (as of {month_end} and today)")
+    sql = build_stop_sql(t, active) if args.per_stop else build_sql(t, active)
     job = client.query(sql, job_config=bigquery.QueryJobConfig(dry_run=True, use_query_cache=False))
     gb = job.total_bytes_processed / 1e9
     print(f"dry run: {gb:.2f} GB")
@@ -147,8 +229,10 @@ def main():
         return
     assert gb <= MAX_SCAN_GB, f"scan {gb:.1f} GB exceeds the {MAX_SCAN_GB:.0f} GB gate"
     df = client.query(sql).to_dataframe()
-    df.to_csv(OUT, index=False)
-    print(f"{len(df):,} route-direction shapes -> {OUT} ({OUT.stat().st_size / 1e6:.1f} MB)")
+    out = OUT_STOP if args.per_stop else OUT
+    df.to_csv(out, index=False)
+    kind = "stop-route-direction" if args.per_stop else "route-direction"
+    print(f"{len(df):,} {kind} shapes -> {out} ({out.stat().st_size / 1e6:.1f} MB)")
 
 
 if __name__ == "__main__":
