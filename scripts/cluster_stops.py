@@ -136,9 +136,13 @@ def pairwise_constraints(route_dirs, feeds, lats, lons, pts_xy, road_lines):
     return cannot_link, distances
 
 
-# detect_splits.py verdicts that act as cannot-link constraints (the rest —
-# VETO / mixed / no-shapes — are review-queue rows, never constraints).
-SPLIT_CONSTRAINT_PREFIXES = ("CONFIRM", "across")
+# detect_splits.py verdicts that act as cannot-link constraints. Everything
+# else — VETO / mixed / no-shapes, and ALSO across-street (antiparallel) —
+# is review-queue only: the 2026-10-31 imagery audit scored every decided
+# CONFIRM/VETO correct but every across-street case "unsure" (antiparallel
+# headings also arise from one mispositioned stop point), so humans rule on
+# that class until it earns its way back in.
+SPLIT_CONSTRAINT_PREFIXES = ("CONFIRM",)
 
 
 def load_split_pairs(path) -> set:

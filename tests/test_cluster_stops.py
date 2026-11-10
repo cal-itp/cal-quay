@@ -181,10 +181,9 @@ class GroupingTests(unittest.TestCase):
         with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False) as f:
             f.write(rows)
         pairs = load_split_pairs(f.name)
-        self.assertEqual(pairs, {
-            frozenset({("X", "1"), ("Y", "2")}),
-            frozenset({("X", "3"), ("Y", "4")}),
-        })
+        # across-street is REVIEW-ONLY (imagery audit: all "unsure") — only
+        # CONFIRM rows load as constraints
+        self.assertEqual(pairs, {frozenset({("X", "1"), ("Y", "2")})})
         self.assertEqual(load_split_pairs("/nonexistent/split_pairs.csv"), set())
 
     def test_load_split_pairs_requires_full_coverage(self):
