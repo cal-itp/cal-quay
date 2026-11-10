@@ -49,6 +49,10 @@ few thousand locations where multiple agencies each publish their own record for
    - **Road crossing (physical-truth):** the segment between two stops crosses a drive-network road
      centerline — tested against the **merged** road geometry so a road split into segments at a
      node still registers — → must separate (opposite sides).
+   - **Travel-heading verdicts (shape-truth, optional):** pairs adjudicated by
+     `scripts/detect_splits.py` (§2b) whose route-shape headings confirm perpendicular
+     (kitty-corner) or antiparallel (across-street) boarding join in as cannot-links whenever
+     `data/split_pairs.csv` is present.
    - Coincident stops (same coordinate) are **never** cannot-linked.
 3. **Partition:** nearest-first merging that refuses to join two partial groups if **any**
    cross-member pair is cannot-linked — avoiding the "a middle stop re-links a forbidden pair"
@@ -56,6 +60,34 @@ few thousand locations where multiple agencies each publish their own record for
    violates a constraint (16,491 cannot-link pairs verified separated).
 4. **Merge coincident:** groups sharing an exact position are merged (one physical stop).
 - **Result:** ~82,474 groups; ~5,700 multi-agency.
+
+### 2b. Split detection — travel headings — `scripts/detect_splits.py`
+Finds grouped stops that should be **separate registry stops** (stops boarding on different
+streets of one corner, or opposite sides of one street). Two nomination signals, one physical
+adjudicator:
+- **Nominate:** (A) *street geometry* — each stop's nearest road edge; street orientations
+  60–120° apart with each stop clearly (≥ 5 m) nearer its own street; (B) *crossed names* —
+  "A St & B St" vs "B St & A St" in one group. The signals are complementary (names catch
+  corner stops whose points snap to the same street).
+- **Adjudicate:** the **travel heading** at each stop from its serving routes' shapes
+  (`scripts/pull_shapes.py`, active feed versions; project the stop, ±10 m chord, compass
+  bearing — chords clamp at shape ends so terminal stops keep their final heading).
+  `direction_id` is never compared across feeds; headings are physical. Verdicts: min pairwise
+  difference < 30° → **VETO** (parallel — same street and direction, a false candidate);
+  all differences 60–120° → **CONFIRM** kitty-corner; min > 150° → **across-street**
+  (antiparallel); else **mixed**; missing shapes → **no-shapes**.
+- Only CONFIRM/across-street rows **with full shape coverage** become constraints;
+  VETO/mixed/no-shapes and partial-coverage rows stay in `data/split_pairs.csv` for the review
+  queue. Coverage is full only when every route serving the stop contributed a heading (a
+  missing parallel shape would read as perpendicular) **and** no shape re-enters the stop's
+  neighborhood within a roadway width (an out-and-back or tight-corner revisit can't be
+  attributed to a boarding without stop-sequence data — the closest pass still supplies the
+  verdict text, but the ambiguity blocks the constraint).
+- Pairs adjudicated in an earlier run that are no longer same-group (their constraint worked)
+  are **carried forward and re-adjudicated** on every run — otherwise the next clustering
+  would remerge them and the system would oscillate.
+- **Verdicts shape the proposal only** — every multi-agency grouping still passes human
+  review with the verdict and headings as evidence.
 
 ### 3. Canonical pick (OSM-scored, provisional)
 - Per stop (in EPSG:3310, OSM road geometry read **per spatial tile**): `dist_to_road_meters`,
@@ -94,12 +126,28 @@ few thousand locations where multiple agencies each publish their own record for
 | Zone max radius | 25 m | `map_canonical_picks.py` |
 | Projection (distance/OSM) | EPSG:3310 (CA Albers) | both |
 | Direction version selection | latest active feed version | `pull_stops.py` |
+| Heading chord | ±10 m along the shape (clamped at ends) | `detect_splits.py` |
+| Shape-passes-stop guard | 30 m | `detect_splits.py` |
+| Revisit-ambiguity radius (extra passes) | 15 m (~a roadway width) | `detect_splits.py` |
+| Parallel veto / perpendicular confirm / antiparallel | < 30° / all 60–120° / > 150° | `detect_splits.py` |
 
 ## Validation
 Spot-checked against a set of 12 statewide shared-stop test cases (DDS, Oct 2026): **10/12
 detected**. The 2 misses are a data-coverage gap (only one agency present in the pull) and one
 close pair not grouped. A larger regression suite (the plan's 7 canonical cases plus a proposed
 50–100 statewide cases) is the next validation step.
+
+**Split detection (Nov 2026):** 944 same-group pairs nominated statewide (602 street-geometry,
+520 crossed-names, 178 both) → 670 CONFIRM / 140 VETO / 15 across-street / 49 mixed / 70
+no-shapes; coverage gating holds 236 confirm-grade pairs back as partial (missing route shapes
+or revisit ambiguity), leaving **449 constraints**. A 54-case satellite-imagery audit ratified
+**every decided CONFIRM (19/19) and VETO (17/17)** verdict; those human-verified pairs ship as
+real-coordinate regression fixtures (`tests/fixtures/human_verified_pairs.csv`) and the suite
+asserts the pipeline splits/keeps each one. Applying the 449 constraints statewide:
+80,664 → 81,007 groups (+343), all 449 pairs separated; a second detect→cluster cycle is a
+fixed point (carried-forward pairs re-adjudicate identically). Across-street verdicts were the
+hard class on imagery (all "unsure") — the 5 full-coverage ones constrain but stay flagged for
+agency confirmation.
 
 ## Current limitations
 - Canonical picks are **automated, not human-reviewed** (the review bucket marks the uncertain ones).
