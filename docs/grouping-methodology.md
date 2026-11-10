@@ -139,16 +139,18 @@ detected**. The 2 misses are a data-coverage gap (only one agency present in the
 close pair not grouped. A larger regression suite (the plan's 7 canonical cases plus a proposed
 50–100 statewide cases) is the next validation step.
 
-**Split detection (Nov 2026):** 944 same-group pairs nominated statewide (602 street-geometry,
-520 crossed-names, 178 both) → 670 CONFIRM / 140 VETO / 15 across-street / 49 mixed / 70
-no-shapes; coverage gating holds 236 confirm-grade pairs back as partial (missing route shapes
-or revisit ambiguity) and across-street is review-only, leaving **444 constraints**. A 54-case satellite-imagery audit ratified
+**Split detection (Oct 2026 cohort, run 2026-11-09):** 956 same-group pairs adjudicated
+statewide → 698 CONFIRM / 143 VETO / 20 across-street / 60 mixed / 35 no-shapes. Coverage
+gating plus the per-stop shapes rescue (`pull_shapes.py --per-stop`, joining through
+dim_stop_times for pairs whose routes publish no shapes) leave **667 constraints**, with only
+31 confirm-grade pairs held back as partial. A 54-case satellite-imagery audit ratified
 **every decided CONFIRM (19/19) and VETO (17/17)** verdict; those human-verified pairs ship as
 real-coordinate regression fixtures (`tests/fixtures/human_verified_pairs.csv`) and the suite
-asserts the pipeline splits/keeps each one. Applying the 444 constraints statewide:
-80,664 → 81,002 groups (+338), all 444 pairs separated; a second detect→cluster cycle is a
-fixed point (carried-forward pairs re-adjudicate identically). Across-street verdicts were the
-hard class on imagery (all "unsure") — the class is review-only (2026-11-09 decision).
+asserts the pipeline splits/keeps each one. Applying the constraints statewide: **81,222 final
+groups** (91,809 stops, 5,338 multi-agency corners), all 667 pairs separated; a second
+detect→cluster cycle is a fixed point (carried-forward pairs re-adjudicate identically).
+Across-street verdicts were the hard class on imagery (all "unsure") — the class is
+review-only (2026-11-09 decision).
 
 ## Current limitations
 - Canonical picks are **automated, not human-reviewed** (the review bucket marks the uncertain ones).
